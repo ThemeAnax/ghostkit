@@ -1,0 +1,53 @@
+{
+  "name": "@indianic/ghostkit",
+  "version": "0.1.0",
+  "description": "Provision Ghost with a theme on any SSH-reachable host. Hands the Admin API key to themeseed.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "bin": {
+    "ghostkit": "./dist/cli/index.js",
+    "ghostkit-mcp": "./dist/mcp/index.js"
+  },
+  "files": [
+    "dist",
+    "scripts",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "prepublishOnly": "npm run build"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "commander": "^15.0.0",
+    "picocolors": "^1.1.1",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "typescript": "^5.7.0"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ThemeAnax/ghostkit.git"
+  },
+  "homepage": "https://github.com/ThemeAnax/ghostkit#readme",
+  "bugs": {
+    "url": "https://github.com/ThemeAnax/ghostkit/issues"
+  },
+  "keywords": [
+    "ghost",
+    "ghost-cms",
+    "mcp",
+    "model-context-protocol",
+    "theme",
+    "provisioning",
+    "ispconfig",
+    "devops"
+  ]
+}

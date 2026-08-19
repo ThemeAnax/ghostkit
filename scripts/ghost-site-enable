@@ -1,0 +1,193 @@
+#!/bin/bash
+# ghost-site-enable — provision a Ghost tenant on an ISPConfig website (server8 pattern)
+#
+# Enables one ISPConfig site to run Ghost under an unprivileged systemd --user
+# unit behind the site's existing Apache vhost + Let's Encrypt cert.
+# Requires: Node 22 LTS, ghost-cli (installed system-wide), jailkit NOT used for this site.
+set -euo pipefail
+
+REGISTRY=/etc/ghost/sites.tsv
+PORT_BASE=50001
+GHOST_VERSION=5          # Ghost 6 requires MySQL 8; this host runs MariaDB.
+DOMAIN=""; PORT=""; CREATE_DB=0; DO_INSTALL=0
+
+die() { echo "ERROR: $*" >&2; exit 1; }
+
+usage() {
+  cat <<EOF
+Usage: ghost-site-enable --domain <fqdn> [options]
+  --domain <fqdn>     ISPConfig website to enable (required)
+  --port <n>          Loopback port (default: next free from ${PORT_BASE})
+  --ghost-version <n> Ghost major version (default: ${GHOST_VERSION})
+  --create-db         Create the MariaDB database directly.
+                      Omit if you created it in the ISPConfig panel (preferred).
+  --install           Also run 'ghost install' as the tenant.
+EOF
+  exit 1
+}
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --domain) DOMAIN="$2"; shift 2;;
+    --port) PORT="$2"; shift 2;;
+    --ghost-version) GHOST_VERSION="$2"; shift 2;;
+    --create-db) CREATE_DB=1; shift;;
+    --install) DO_INSTALL=1; shift;;
+    *) usage;;
+  esac
+done
+[ -n "$DOMAIN" ] || usage
+[ "$(id -u)" = 0 ] || die "must run as root"
+
+command -v ghost >/dev/null || die "ghost-cli not installed (npm i -g ghost-cli)"
+node -v | grep -qE '^v22\.' || die "Node 22 LTS required; found $(node -v)"
+
+# ---- resolve the site from ISPConfig ----
+read -r DOMAIN_ID DOCROOT SYSUSER SYSGROUP < <(
+  mysql -N -B -e "SELECT domain_id,document_root,system_user,system_group
+                  FROM dbispconfig.web_domain
+                  WHERE domain='${DOMAIN}' AND active='y';" ) \
+  || die "site '${DOMAIN}' not found or inactive in ISPConfig"
+[ -n "${DOCROOT:-}" ] || die "site '${DOMAIN}' not found in ISPConfig"
+
+SHELLUSER="$(mysql -N -B -e "SELECT username FROM dbispconfig.shell_user
+                             WHERE parent_domain_id=${DOMAIN_ID} AND active='y' LIMIT 1;")"
+[ -n "$SHELLUSER" ] || die "no active shell user for ${DOMAIN} — create one in ISPConfig first"
+
+CHROOT="$(mysql -N -B -e "SELECT chroot FROM dbispconfig.shell_user
+                          WHERE parent_domain_id=${DOMAIN_ID} LIMIT 1;")"
+[ "$CHROOT" != "jailkit" ] || die "shell user '${SHELLUSER}' is jailkit-chrooted.
+  systemd --user cannot reach into a jail (no XDG_RUNTIME_DIR).
+  Set Chroot=None on this shell user in ISPConfig, then re-run."
+
+UID_N="$(id -u "$SYSUSER")"
+GHOSTDIR="${DOCROOT}/web/ghost"
+UNITDIR="${DOCROOT}/.config/systemd/user"
+
+# ---- allocate port ----
+mkdir -p /etc/ghost
+[ -f "$REGISTRY" ] || printf "# port\tuid\tsite\tdir\n" > "$REGISTRY"
+EXISTING="$(awk -v d="$DOMAIN" -F'\t' '$3==d{print $1; exit}' "$REGISTRY")"
+if [ -n "$EXISTING" ]; then
+  # already provisioned — reuse its port so re-running is idempotent
+  if [ -z "$PORT" ]; then
+    PORT="$EXISTING"
+    echo "==> ${DOMAIN} already registered on port ${PORT}, reusing"
+  elif [ "$PORT" != "$EXISTING" ]; then
+    die "${DOMAIN} is registered on port ${EXISTING} but --port ${PORT} was given.
+  Changing the port means editing config.production.json and the Apache directive.
+  Remove the registry row in ${REGISTRY} first if that is really what you want."
+  fi
+elif [ -z "$PORT" ]; then
+  PORT=$PORT_BASE
+  while awk -v p="$PORT" -F'\t' '$1==p{f=1} END{exit !f}' "$REGISTRY" || ss -ltn | grep -q ":${PORT} "; do
+    PORT=$((PORT+1))
+  done
+fi
+echo "==> ${DOMAIN}: user=${SYSUSER}(${UID_N}) shell=${SHELLUSER} port=${PORT}"
+
+# ---- group + linger ----
+getent group ghost-users >/dev/null || groupadd ghost-users
+usermod -aG ghost-users "$SYSUSER"
+usermod -aG ghost-users "$SHELLUSER"
+loginctl enable-linger "$SYSUSER"
+
+# ---- dirs. ISPConfig sets +i on the webroot; lift only to create .config once ----
+if [ ! -d "$UNITDIR" ]; then
+  chattr -i "$DOCROOT"
+  mkdir -p "$UNITDIR"
+  chown -R "${SYSUSER}:${SYSGROUP}" "${DOCROOT}/.config"
+  chattr +i "$DOCROOT"
+fi
+mkdir -p "$GHOSTDIR"
+chown "${SYSUSER}:${SYSGROUP}" "$GHOSTDIR"
+chmod 775 "$GHOSTDIR"
+
+# ---- database ----
+DBNAME="$(echo "c1${DOMAIN}" | tr -cd '[:alnum:]' | cut -c1-32)"
+DBUSER="$DBNAME"
+PWFILE="/etc/ghost/${DBNAME}.dbpass"
+if [ "$CREATE_DB" = 1 ]; then
+  if [ ! -f "$PWFILE" ]; then
+    openssl rand -base64 24 | tr -d '/+=' | head -c 24 > "$PWFILE"; chmod 600 "$PWFILE"
+  fi
+  DBPASS="$(cat "$PWFILE")"
+  mysql <<SQL
+CREATE DATABASE IF NOT EXISTS \`${DBNAME}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci;
+CREATE USER IF NOT EXISTS '${DBUSER}'@'127.0.0.1' IDENTIFIED BY '${DBPASS}';
+ALTER USER '${DBUSER}'@'127.0.0.1' IDENTIFIED BY '${DBPASS}';
+GRANT ALL PRIVILEGES ON \`${DBNAME}\`.* TO '${DBUSER}'@'127.0.0.1';
+FLUSH PRIVILEGES;
+SQL
+  echo "==> database ${DBNAME} ready (password: ${PWFILE})"
+  echo "    NOTE: created outside ISPConfig, so it will NOT appear in the panel."
+fi
+
+# ---- systemd user unit ----
+cat > "${UNITDIR}/ghost.service" <<UNIT
+[Unit]
+Description=Ghost CMS - ${DOMAIN}
+Documentation=https://ghost.org/docs/
+
+[Service]
+Type=simple
+WorkingDirectory=${GHOSTDIR}
+Environment="NODE_ENV=production"
+ExecStart=/usr/bin/node current/index.js
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target
+UNIT
+chown "${SYSUSER}:${SYSGROUP}" "${UNITDIR}/ghost.service"
+chmod 644 "${UNITDIR}/ghost.service"
+
+# ---- registry ----
+awk -v d="$DOMAIN" -F'\t' '$3==d{f=1} END{exit !f}' "$REGISTRY" || \
+  printf "%s\t%s\t%s\t%s\n" "$PORT" "$UID_N" "$DOMAIN" "$GHOSTDIR" >> "$REGISTRY"
+
+# ---- optional install ----
+if [ "$DO_INSTALL" = 1 ]; then
+  [ -f "$PWFILE" ] || die "--install needs the DB password at ${PWFILE} (use --create-db, or write it there)"
+  su - "$SHELLUSER" -c "cd '${GHOSTDIR}' && ghost install ${GHOST_VERSION} \
+    --db mysql --dbhost 127.0.0.1 --dbuser '${DBUSER}' --dbpass '$(cat "$PWFILE")' --dbname '${DBNAME}' \
+    --url 'https://${DOMAIN}' --port ${PORT} \
+    --process local \
+    --no-setup-mysql --no-setup-nginx --no-setup-ssl --no-setup-systemd --no-setup-linux-user \
+    --no-start --no-prompt"
+  # --process local is REQUIRED. Without it ghost-cli leaves process=systemd and
+  # every ghost command runs `sudo systemctl ...`, which hangs on a password
+  # prompt the tenant cannot answer.
+  su - "$SHELLUSER" -c "export XDG_RUNTIME_DIR=/run/user/${UID_N}; \
+    export DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/${UID_N}/bus; \
+    systemctl --user daemon-reload && systemctl --user enable --now ghost.service"
+  # 600, not 640: ISPConfig puts www-data in the client group, so group-read
+  # would expose the DB password to the web server user.
+  chmod 600 "${GHOSTDIR}/config.production.json"
+fi
+
+cat <<EOF
+
+===============================================================
+Paste into ISPConfig -> Sites -> ${DOMAIN} -> Options -> Apache Directives
+===============================================================
+# Let's Encrypt ACME must not be proxied, or renewals break
+ProxyPass /.well-known/ !
+
+ProxyRequests Off
+ProxyPreserveHost On
+ProxyPass        / http://127.0.0.1:${PORT}/ retry=0 timeout=120
+ProxyPassReverse / http://127.0.0.1:${PORT}/
+RequestHeader set X-Forwarded-Proto "https"
+
+<FilesMatch "^config\.(production|development)\.json$">
+    Require all denied
+</FilesMatch>
+===============================================================
+
+Tenant (${SHELLUSER}) commands — no sudo required:
+  cd ${GHOSTDIR}
+  ghost update / ghost backup / ghost log / ghost doctor
+  systemctl --user restart ghost
+EOF

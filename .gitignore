@@ -1,0 +1,5 @@
+node_modules/
+dist/
+*.log
+ghostkit.config.json
+.DS_Store
