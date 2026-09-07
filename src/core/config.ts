@@ -1,4 +1,4 @@
-import { readFileSync, writeFileSync, existsSync } from "node:fs";
+import { chmodSync, closeSync, existsSync, openSync, readFileSync, writeSync } from "node:fs";
 import { homedir } from "node:os";
 import { resolve } from "node:path";
 import { z } from "zod";
@@ -67,10 +67,26 @@ export function configPath(dir = process.cwd()): string {
   return resolve(expandHome(dir), CONFIG_FILENAME);
 }
 
+/**
+ * This file holds the database password, so it must never exist
+ * world-readable — not even for the instant between create and chmod. The
+ * mode passed to open() applies only on creation, so an already-present file
+ * (created 0644 by an earlier version) is corrected explicitly.
+ */
+export function writeConfigFile(path: string, data: unknown): void {
+  const fd = openSync(path, "w", 0o600);
+  try {
+    writeSync(fd, JSON.stringify(data, null, 2) + "\n");
+  } finally {
+    closeSync(fd);
+  }
+  chmodSync(path, 0o600);
+}
+
 export function initConfig(dir = process.cwd()): { path: string; created: boolean; needsFilling: string[] } {
   const path = configPath(dir);
   const created = !existsSync(path);
-  if (created) writeFileSync(path, JSON.stringify(BLANK, null, 2) + "\n");
+  if (created) writeConfigFile(path, BLANK);
   return { path, created, needsFilling: missingFields(created ? BLANK : readRaw(path)) };
 }
 

@@ -44,6 +44,18 @@ done
 [ -n "$DOMAIN" ] || usage
 [ "$(id -u)" = 0 ] || die "must run as root"
 
+# The database name and user reach SQL that runs as root, and MySQL cannot
+# parameterise identifiers — validation is the only defence. These values come
+# from the panel via sshcon, so they are external input, not our own.
+for pair in "name:${DBNAME_OVERRIDE}" "user:${DBUSER_OVERRIDE}"; do
+  what="${pair%%:*}"; val="${pair#*:}"
+  [ -n "$val" ] || continue
+  case "$val" in
+    *[!A-Za-z0-9_]*) die "database ${what} may contain only letters, digits and underscore: '${val}'";;
+  esac
+  [ "${#val}" -le 64 ] || die "database ${what} is longer than 64 characters: '${val}'"
+done
+
 # ---- resolve the site from ISPConfig ----
 read -r DOMAIN_ID DOCROOT SYSUSER SYSGROUP < <(
   mysql -N -B -e "SELECT domain_id,document_root,system_user,system_group
@@ -158,10 +170,14 @@ elif [ ! -f "$PWFILE" ]; then
   openssl rand -base64 24 | tr -d '/+=' | head -c 24 > "$PWFILE"; chmod 600 "$PWFILE"
 fi
 DBPASS="$(cat "$PWFILE")"
+# A password is a SQL string literal, so a quote or backslash in it would end
+# the literal early — a broken install at best, injected SQL at worst. Doubling
+# the quote and escaping the backslash is what MySQL expects.
+DBPASS_ESC=$(printf '%s' "$DBPASS" | sed "s/\\\\/\\\\\\\\/g; s/'/''/g")
 mysql <<SQL
 CREATE DATABASE IF NOT EXISTS \`${DBNAME}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci;
-CREATE USER IF NOT EXISTS '${DBUSER}'@'127.0.0.1' IDENTIFIED BY '${DBPASS}';
-ALTER USER '${DBUSER}'@'127.0.0.1' IDENTIFIED BY '${DBPASS}';
+CREATE USER IF NOT EXISTS '${DBUSER}'@'127.0.0.1' IDENTIFIED BY '${DBPASS_ESC}';
+ALTER USER '${DBUSER}'@'127.0.0.1' IDENTIFIED BY '${DBPASS_ESC}';
 GRANT ALL PRIVILEGES ON \`${DBNAME}\`.* TO '${DBUSER}'@'127.0.0.1';
 FLUSH PRIVILEGES;
 SQL

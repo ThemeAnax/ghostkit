@@ -1,19 +1,19 @@
 #!/usr/bin/env node
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { readFileSync, writeFileSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
 
-import { initConfig, loadConfig, missingFields, configPath } from "../core/config.js";
+import { initConfig, loadConfig, missingFields, configPath, writeConfigFile } from "../core/config.js";
 import { Ssh, shellQuote } from "../core/ssh.js";
 import { preflight, setupStatus, installedVersion, waitForGhost } from "../core/ghost.js";
 import { resolveSite, apacheDirectives, serviceState } from "../core/site.js";
 import { readSshconServer } from "../core/sshcon.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
-const VERSION = "0.2.0";
+const VERSION = "0.2.1";
 
 const server = new McpServer({ name: "ghostkit", version: VERSION });
 
@@ -121,7 +121,8 @@ server.registerTool(
     };
     if (s.appPort && !raw.site?.port) raw.site = { ...(raw.site ?? {}), port: s.appPort };
 
-    writeFileSync(path, JSON.stringify(raw, null, 2) + "\n");
+    // 0600: this write is what puts the database password in the file.
+    writeConfigFile(path, raw);
 
     const mask = (v: string) => (v ? `${v.slice(0, 3)}***(${v.length})` : "");
     return json({
