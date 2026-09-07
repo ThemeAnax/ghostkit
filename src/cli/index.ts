@@ -3,11 +3,11 @@ import { Command } from "commander";
 import pc from "picocolors";
 import { initConfig, loadConfig } from "../core/config.js";
 import { Ssh } from "../core/ssh.js";
-import { preflight } from "../core/ghost.js";
-import { resolveSite, apacheDirectives } from "../core/site.js";
+import { preflight, setupStatus, installedVersion } from "../core/ghost.js";
+import { resolveSite, apacheDirectives, serviceState } from "../core/site.js";
 
 const program = new Command();
-program.name("ghostkit").description("Provision Ghost with a theme on any SSH-reachable host").version("0.1.0");
+program.name("ghostkit").description("Install Ghost on any SSH-reachable ISPConfig host").version("0.2.0");
 
 program
   .command("init")
@@ -15,10 +15,7 @@ program
   .action(() => {
     const r = initConfig();
     console.log(r.created ? pc.green(`created ${r.path}`) : pc.yellow(`exists ${r.path}`));
-    if (r.needsFilling.length) {
-      console.log(pc.dim("still required:"));
-      for (const f of r.needsFilling) console.log(`  - ${f}`);
-    }
+    for (const f of r.needsFilling) console.log(pc.dim(`  still required: ${f}`));
   });
 
 program
@@ -26,15 +23,30 @@ program
   .description("Check the host is ready")
   .action(async () => {
     const cfg = loadConfig();
-    const ssh = new Ssh(cfg.server);
-    const r = await preflight(ssh, { domain: cfg.site.domain });
+    const r = await preflight(new Ssh(cfg.server), { domain: cfg.site.domain });
     for (const c of r.checks) {
       const mark = c.ok ? pc.green("PASS") : c.blocking ? pc.red("FAIL") : pc.yellow("WARN");
-      console.log(`${mark}  ${c.name.padEnd(28)} ${c.detail}`);
+      console.log(`${mark}  ${c.name.padEnd(24)} ${c.detail}`);
       if (!c.ok && c.fix) console.log(pc.dim(`      fix: ${c.fix}`));
     }
-    console.log(`\nGhost ${r.db.ghostVersion} on ${r.db.engine} ${r.db.version}`);
+    console.log(`\n${r.db.engine} ${r.db.version}`);
     if (r.blocked) process.exitCode = 1;
+  });
+
+program
+  .command("status")
+  .description("Is the site up, and has anyone claimed it?")
+  .action(async () => {
+    const cfg = loadConfig();
+    const ssh = new Ssh(cfg.server);
+    const site = await resolveSite(ssh, cfg.site.domain);
+    const claimed = await setupStatus(ssh, site.port, cfg.site.domain);
+    console.log(`domain    ${site.domain}`);
+    console.log(`ghost     ${await installedVersion(ssh, site)}`);
+    console.log(`service   ${await serviceState(ssh, site)}`);
+    console.log(`port      ${site.port}`);
+    console.log(`claimed   ${claimed ? pc.green("yes") : pc.red("NO — anyone can claim this site")}`);
+    console.log(`admin     https://${site.domain}/ghost/`);
   });
 
 program

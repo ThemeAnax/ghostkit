@@ -3,3 +3,4 @@ dist/
 *.log
 ghostkit.config.json
 .DS_Store
+.omc/

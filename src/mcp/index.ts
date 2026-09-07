@@ -1,19 +1,19 @@
 #!/usr/bin/env node
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { readFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
 
 import { initConfig, loadConfig, missingFields, configPath } from "../core/config.js";
 import { Ssh, shellQuote } from "../core/ssh.js";
-import { preflight, setupOwner, createAdminKey, installTheme, setupStatus } from "../core/ghost.js";
-import { resolveSite, apacheDirectives, restartGhost } from "../core/site.js";
-import { configureGhostMail, sendNotification } from "../core/mail.js";
+import { preflight, setupStatus, installedVersion, waitForGhost } from "../core/ghost.js";
+import { resolveSite, apacheDirectives, serviceState } from "../core/site.js";
+import { readSshconServer } from "../core/sshcon.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
-const VERSION = "0.1.0";
+const VERSION = "0.2.0";
 
 const server = new McpServer({ name: "ghostkit", version: VERSION });
 
@@ -25,14 +25,39 @@ function sshFor(dir?: string) {
   return { cfg, ssh: new Ssh(cfg.server) };
 }
 
+/** What the user does after ghostkit steps back. Kept in one place. */
+function nextSteps(domain: string, ghostDir: string, shellUser: string) {
+  return {
+    "1_create_your_admin_account": `Open https://${domain}/ghost/ and create the owner account. ` +
+      `This endpoint is unauthenticated and one-shot — the FIRST person to open it owns the site. Do it now.`,
+    "2_install_a_theme": `Ghost admin -> Settings -> Design -> Change theme -> Upload theme, and pick your zip.`,
+    "3_set_up_email_sendgrid": [
+      `Transactional mail (member logins, staff invites, password resets) needs SMTP.`,
+      `As ${shellUser}:  cd ${ghostDir} && ghost config mail.transport SMTP \\`,
+      `  && ghost config mail.options.service SendGrid \\`,
+      `  && ghost config mail.options.auth.user apikey \\`,
+      `  && ghost config mail.options.auth.pass '<SG.your-key>' \\`,
+      `  && ghost config mail.from 'noreply@${domain}'`,
+      `Newsletters (bulk mail) are Mailgun-only in Ghost; SendGrid cannot send them.`,
+    ].join("\n"),
+    "4_re_enable_the_sign_in_code": `ghostkit set security.staffDeviceVerification=false in ` +
+      `${ghostDir}/config.production.json, because Ghost emails a sign-in code and, with no mail ` +
+      `configured, that locks you out of your own site. Once step 3 works, set it back to true.`,
+    "5_restart": `As ${shellUser}:  systemctl --user restart ghost   (no sudo needed)`,
+    "6_admin_api_key_for_themeseed": `Ghost admin -> Settings -> Integrations -> Add custom integration. ` +
+      `Copy the Admin API key ({id}:{secret}) and give it to themeseed's add_site. ` +
+      `themeseed rejects Content API keys.`,
+  };
+}
+
 server.registerTool(
   "init_config",
   {
     title: "Create a blank ghostkit config",
     description:
-      "Write a blank ghostkit.config.json for the user to fill in, and report which fields are still required. " +
-      "Always the first step. Does not overwrite an existing file.",
-    inputSchema: { dir: z.string().optional().describe("Directory to write the config into. Defaults to cwd.") },
+      "Write a blank ghostkit.config.json and report which fields still need filling. Always the first step. " +
+      "Does not overwrite an existing file.",
+    inputSchema: { dir: z.string().optional().describe("Directory for the config. Defaults to cwd.") },
   },
   async ({ dir }) => {
     const r = initConfig(dir);
@@ -40,9 +65,78 @@ server.registerTool(
       path: r.path,
       created: r.created,
       still_required: r.needsFilling,
-      note:
-        "Fill the file, then run preflight. Set server.sshcon_alias if the host is managed by sshcon, " +
-        "otherwise set server.host/user/ssh_key_path. Leave database.* blank to auto-generate.",
+      note: "With sshcon: set server.sshcon_alias, then run resolve_server. Without it, fill server.host, server.user, server.ssh_key_path and the database block by hand.",
+    });
+  },
+);
+
+server.registerTool(
+  "resolve_server",
+  {
+    title: "Fill server and database details from an sshcon alias",
+    description:
+      "Read `sshcon list <alias> all` and write what it knows into the config: the root exec alias (from the " +
+      "alias's Server Name), SSH host and port, the database the panel provisioned, and the allocated " +
+      "application port. Without sshcon those fields must be filled in by hand. Secrets go to the config file, " +
+      "never into the response.",
+    inputSchema: {
+      dir: z.string().optional(),
+      alias: z.string().optional().describe("Overrides server.sshcon_alias from the config."),
+    },
+  },
+  async ({ dir, alias }) => {
+    const path = configPath(dir);
+    let raw: Record<string, Record<string, unknown>>;
+    try {
+      raw = JSON.parse(readFileSync(path, "utf8"));
+    } catch (e) {
+      return json({ ok: false, path, error: (e as Error).message, hint: "Run init_config first." });
+    }
+
+    const useAlias = alias || (raw.server?.sshcon_alias as string) || "";
+    if (!useAlias) {
+      return json({
+        ok: false,
+        error: "No server.sshcon_alias set and no alias given.",
+        hint: "Set server.sshcon_alias, or fill server.host / server.user / server.ssh_key_path and the database block by hand.",
+      });
+    }
+
+    const s = await readSshconServer(useAlias);
+
+    // server.user is deliberately untouched: it is the account provisioning
+    // runs as, which must be root. s.username is the unprivileged tenant, and
+    // the shell user is read back from ISPConfig anyway.
+    raw.server = {
+      ...(raw.server ?? {}),
+      sshcon_alias: useAlias,
+      exec_alias: s.serverName || useAlias,
+      host: s.host,
+      port: s.port,
+    };
+    raw.database = {
+      name: (raw.database?.name as string) || s.database.name,
+      user: (raw.database?.user as string) || s.database.user,
+      password: (raw.database?.password as string) || s.database.password,
+    };
+    if (s.appPort && !raw.site?.port) raw.site = { ...(raw.site ?? {}), port: s.appPort };
+
+    writeFileSync(path, JSON.stringify(raw, null, 2) + "\n");
+
+    const mask = (v: string) => (v ? `${v.slice(0, 3)}***(${v.length})` : "");
+    return json({
+      ok: true,
+      path,
+      derived: {
+        exec_alias: raw.server.exec_alias,
+        exec_alias_note: `provisioning runs through '${raw.server.exec_alias}' — the root login for this host`,
+        host: s.host,
+        ssh_port: s.port,
+        tenant_user: s.username,
+        application_port: s.appPort,
+        database: { name: s.database.name, user: s.database.user, password: mask(s.database.password) },
+      },
+      still_required: missingFields(raw),
     });
   },
 );
@@ -52,166 +146,80 @@ server.registerTool(
   {
     title: "Check the host is ready for Ghost",
     description:
-      "Run every host check in one pass: Node version, ghost-cli, database engine, systemd, whether the shell " +
-      "user is jailed (a hard blocker), and outbound SMTP. Returns a pass/fail matrix with fix commands. " +
-      "Also decides which Ghost major version this host can safely run.",
+      "Every host check in one pass: the domain and its shell user, Node and ghost-cli AS THE TENANT (root's " +
+      "PATH proves nothing about theirs), the database engine, systemd, and whether the shell user is jailed. " +
+      "Returns a pass/fail matrix with fix commands.",
     inputSchema: { dir: z.string().optional() },
   },
   async ({ dir }) => {
     const { cfg, ssh } = sshFor(dir);
     const r = await preflight(ssh, { domain: cfg.site.domain });
-    const wanted = cfg.site.ghost_version === "auto" ? r.db.ghostVersion : cfg.site.ghost_version;
-    const conflict =
-      wanted === "6" && r.db.engine === "mariadb"
-        ? "Ghost 6 on MariaDB is not supported. Either set ghost_version to 5 or install MySQL 8."
-        : undefined;
-    return json({ ...r, resolved_ghost_version: wanted, conflict });
+    return json({
+      ...r,
+      note:
+        r.db.engine === "mariadb"
+          ? "Ghost officially supports MySQL 8 only; MariaDB is unsupported but works in practice."
+          : undefined,
+    });
   },
 );
 
 server.registerTool(
   "install_ghost",
   {
-    title: "Install Ghost bound to loopback",
+    title: "Install the latest Ghost into the domain's web folder",
     description:
-      "Install Ghost for the configured domain on a private loopback port under a systemd --user unit. " +
-      "The site is NOT publicly reachable afterwards — that is deliberate, so ownership can be claimed first. " +
-      "Requires the domain and its shell user (Chroot = None) to already exist on the host.",
+      "Install Ghost on a private loopback port under a systemd --user unit, in the domain's own web folder. " +
+      "Installs the LATEST Ghost. Creates no owner account and no theme — you do that yourself at /ghost/ " +
+      "afterwards. The site is NOT publicly reachable until publish_site.",
     inputSchema: {
       dir: z.string().optional(),
-      port: z.number().int().optional().describe("Loopback port. Auto-allocated from 50001 if omitted."),
+      port: z.number().int().optional().describe("Loopback port. Defaults to site.port, else auto-allocated from 50001."),
+      ghost_version: z.string().optional().describe("Pin a major version, e.g. \"5\". Default: latest."),
+      wipe: z
+        .boolean()
+        .optional()
+        .describe("Clear the web folder even when it holds files that are not ISPConfig defaults or a previous Ghost."),
     },
   },
-  async ({ dir, port }) => {
+  async ({ dir, port, ghost_version, wipe }) => {
     const { cfg, ssh } = sshFor(dir);
     const pre = await preflight(ssh, { domain: cfg.site.domain });
     if (pre.blocked) {
       return json({ ok: false, error: "preflight blocked", checks: pre.checks.filter((c) => !c.ok) });
     }
-    const version = cfg.site.ghost_version === "auto" ? pre.db.ghostVersion : cfg.site.ghost_version;
 
-    // Ship the provisioning script rather than assuming it is on the host.
+    // Ship the script rather than assuming it is already on the host.
     const script = readFileSync(resolve(here, "../../scripts/ghost-site-enable"), "utf8");
     const b64 = Buffer.from(script).toString("base64");
     await ssh.must(
       `echo ${shellQuote(b64)} | base64 -d > /usr/local/sbin/ghost-site-enable && chmod +x /usr/local/sbin/ghost-site-enable`,
     );
 
+    const effectivePort = port ?? cfg.site.port ?? undefined;
     const args = [
       `--domain ${shellQuote(cfg.site.domain)}`,
-      `--ghost-version ${version}`,
-      "--create-db",
-      "--install",
-      port ? `--port ${port}` : "",
+      effectivePort ? `--port ${effectivePort}` : "",
+      ghost_version ? `--ghost-version ${shellQuote(ghost_version)}` : "",
+      wipe ? "--wipe" : "",
+      cfg.database.name ? `--dbname ${shellQuote(cfg.database.name)}` : "",
+      cfg.database.user ? `--dbuser ${shellQuote(cfg.database.user)}` : "",
+      cfg.database.password ? `--dbpass ${shellQuote(cfg.database.password)}` : "",
     ]
       .filter(Boolean)
       .join(" ");
+
     const out = await ssh.must(`/usr/local/sbin/ghost-site-enable ${args}`, { timeoutMs: 900_000 });
     const site = await resolveSite(ssh, cfg.site.domain);
-    return json({ ok: true, ghost_version: version, site, log: out.slice(-4000) });
-  },
-);
+    const up = await waitForGhost(ssh, site.port, cfg.site.domain);
 
-server.registerTool(
-  "setup_owner",
-  {
-    title: "Claim ownership of the Ghost site",
-    description:
-      "Create the owner account through Ghost's one-shot Setup API, over loopback, BEFORE the site is public. " +
-      "This endpoint is unauthenticated: whoever calls it first owns the site, so never expose the site before " +
-      "running this. Idempotent — reports if setup already ran.",
-    inputSchema: { dir: z.string().optional() },
-  },
-  async ({ dir }) => {
-    const { cfg, ssh } = sshFor(dir);
-    const site = await resolveSite(ssh, cfg.site.domain);
-    const r = await setupOwner(ssh, site.port, cfg.site.domain, {
-      name: cfg.owner.name,
-      email: cfg.owner.email,
-      password: cfg.owner.password,
-      blogTitle: cfg.site.title,
-    });
-    return json({ ...r, admin_url: `https://${cfg.site.domain}/ghost/` });
-  },
-);
-
-server.registerTool(
-  "create_admin_key",
-  {
-    title: "Create an Admin API key for themeseed",
-    description:
-      "Log in as the owner and create a custom integration, returning an Admin API key as {id}:{secret}. " +
-      "Pass this to themeseed's add_site — themeseed rejects Content API keys.",
-    inputSchema: { dir: z.string().optional(), name: z.string().optional() },
-  },
-  async ({ dir, name }) => {
-    const { cfg, ssh } = sshFor(dir);
-    const site = await resolveSite(ssh, cfg.site.domain);
-    if (!(await setupStatus(ssh, site.port, cfg.site.domain))) {
-      return json({ ok: false, error: "Owner not set up yet — run setup_owner first." });
-    }
-    const key = await createAdminKey(
-      ssh,
-      site.port,
-      cfg.site.domain,
-      { email: cfg.owner.email, password: cfg.owner.password },
-      name ?? "ghostkit",
-    );
-    return json({ ok: true, admin_api_key: key, url: `https://${cfg.site.domain}` });
-  },
-);
-
-server.registerTool(
-  "install_theme",
-  {
-    title: "Upload and activate a theme",
-    description:
-      "Download the theme zip from theme.zip_url onto the host, upload it through the Admin API, and activate it. " +
-      "Must run BEFORE themeseed generates content — themeseed analyses the ACTIVE theme.",
-    inputSchema: {
-      dir: z.string().optional(),
-      admin_api_key: z.string().describe("From create_admin_key, as {id}:{secret}"),
-      zip_url: z.string().optional().describe("Overrides theme.zip_url from the config"),
-    },
-  },
-  async ({ dir, admin_api_key, zip_url }) => {
-    const { cfg, ssh } = sshFor(dir);
-    const url = zip_url || cfg.theme.zip_url;
-    if (!url) return json({ ok: false, error: "No theme zip URL in config or arguments." });
-    const site = await resolveSite(ssh, cfg.site.domain);
-    const r = await installTheme(ssh, site.port, cfg.site.domain, admin_api_key, url, cfg.theme.activate);
-    return json({ ok: true, theme: r });
-  },
-);
-
-server.registerTool(
-  "configure_mail",
-  {
-    title: "Point Ghost's transactional mail at SendGrid",
-    description:
-      "Write a root-managed env file owned by the site user and reference it from the systemd unit, then restart " +
-      "Ghost. Covers member signup/login links and staff invites. NOTE: Ghost requires Mailgun for bulk " +
-      "newsletter sending — SendGrid cannot send newsletters.",
-    inputSchema: { dir: z.string().optional() },
-  },
-  async ({ dir }) => {
-    const { cfg, ssh } = sshFor(dir);
-    if (!cfg.mail.sendgrid_api_key) return json({ ok: false, error: "mail.sendgrid_api_key is empty" });
-    const site = await resolveSite(ssh, cfg.site.domain);
-    const { envPath } = await configureGhostMail(ssh, {
-      domain: cfg.site.domain,
-      sysUser: site.sysUser,
-      sysGroup: site.sysGroup,
-      unitPath: site.unitPath,
-      sendgridApiKey: cfg.mail.sendgrid_api_key,
-      from: cfg.mail.from,
-    });
-    const state = await restartGhost(ssh, site);
     return json({
       ok: true,
-      env_path: envPath,
-      ghost: state,
-      warning: "SendGrid covers transactional mail only. Newsletters require Mailgun.",
+      ghost_version: await installedVersion(ssh, site),
+      responding_on_loopback: up,
+      site,
+      next: "Run publish_site to expose it, then claim the owner account immediately.",
+      log: out.slice(-3000),
     });
   },
 );
@@ -219,11 +227,11 @@ server.registerTool(
 server.registerTool(
   "publish_site",
   {
-    title: "Get the Apache directives that make the site public",
+    title: "Get the vhost directives that make the site public",
     description:
-      "Returns the vhost directive block and port. This server does NOT write it — call sshmanager_set_domain_port " +
-      "(simplest, includes WebSocket upgrade and ACME passthrough) or sshmanager_update_domain with these " +
-      "directives, or paste them into ISPConfig manually. Run this LAST: it is the step that exposes the site.",
+      "Return the Apache directive block and port. This server does NOT write it — apply it with " +
+      "sshmanager_update_domain({server_id, apache_directives}), or paste it into ISPConfig. Run this LAST: " +
+      "it is the step that exposes the site.",
     inputSchema: { dir: z.string().optional() },
   },
   async ({ dir }) => {
@@ -236,58 +244,80 @@ server.registerTool(
       owner_claimed: claimed,
       warning: claimed
         ? undefined
-        : "Owner NOT yet claimed. Publishing now lets anyone claim this site. Run setup_owner first.",
+        : `UNCLAIMED. Once this is public, https://${cfg.site.domain}/ghost/ will let ANYONE create the owner ` +
+          `account — Ghost's setup endpoint is unauthenticated and one-shot. Open it and claim the site the ` +
+          `moment the directives are applied, then run status to confirm.`,
       how_to_apply: [
-        "sshmanager_set_domain_port({server_id, port}) — regenerates a standard proxy block, or",
-        "sshmanager_update_domain({server_id, apache_directives}) — writes these verbatim, or",
+        "sshmanager_update_domain({server_id, apache_directives}) — writes these verbatim. PREFERRED.",
         "paste into ISPConfig -> Sites -> Options -> Apache Directives",
       ],
       trap:
-        "Never send application_ports to sshmanager_update_domain without apache_directives — it regenerates " +
-        "and overwrites the directive block.",
+        "Do NOT use sshmanager_set_domain_port for this. It regenerates its own proxy block and drops " +
+        'RequestHeader set X-Forwarded-Proto "https", after which Ghost answers POST ' +
+        "/ghost/api/admin/session/ with 201 and no Set-Cookie — so nobody can sign in and the admin UI just " +
+        "spins. Same trap applies to sending application_ports to sshmanager_update_domain without " +
+        "apache_directives.",
     });
   },
 );
 
 server.registerTool(
-  "report",
+  "status",
   {
-    title: "Summarise the install and optionally email it",
+    title: "Is the site up, and has anyone claimed it?",
     description:
-      "Collect the final state of the site and, when mail.notify_on_complete is set, send the summary via the " +
-      "SendGrid API directly (independent of Ghost's own mail config).",
-    inputSchema: { dir: z.string().optional(), admin_api_key: z.string().optional() },
+      "Probe the live host and report the truth: Ghost version, service state, loopback health, whether the " +
+      "public URL answers, and — most importantly — whether the owner account has been claimed yet. Never " +
+      "fails; always answers. Safe to run at any point.",
+    inputSchema: { dir: z.string().optional() },
   },
-  async ({ dir, admin_api_key }) => {
+  async ({ dir }) => {
     const { cfg, ssh } = sshFor(dir);
     const site = await resolveSite(ssh, cfg.site.domain);
-    const state = await ssh.exec(
-      `su - ${shellQuote(site.shellUser)} -c 'systemctl --user is-active ghost' 2>/dev/null`,
+    const claimed = await setupStatus(ssh, site.port, cfg.site.domain);
+    const loopback = await ssh.curlLoopback(site.port, cfg.site.domain, "/ghost/api/admin/site/");
+    const publicProbe = await ssh.exec(
+      `curl -sS -o /dev/null -m 15 -w '%{http_code}' ${shellQuote(`https://${cfg.site.domain}/`)} 2>/dev/null || echo 000`,
     );
-    const summary = {
-      url: `https://${cfg.site.domain}`,
+
+    return json({
+      domain: cfg.site.domain,
+      ghost_version: await installedVersion(ssh, site),
+      service: await serviceState(ssh, site),
+      loopback_http: loopback.status,
+      public_http: Number(publicProbe.stdout.trim()) || 0,
+      owner_claimed: claimed,
       admin_url: `https://${cfg.site.domain}/ghost/`,
-      owner_email: cfg.owner.email,
+      warning: claimed
+        ? undefined
+        : "OWNER NOT CLAIMED. If this site is already public, anyone who opens /ghost/ can take it. Claim it now.",
       port: site.port,
       ghost_dir: site.ghostDir,
       shell_user: site.shellUser,
-      service: state.stdout.trim(),
-      admin_api_key: admin_api_key ?? "(not requested)",
-    };
+    });
+  },
+);
 
-    let notified: unknown = "not configured";
-    if (cfg.mail.notify_on_complete && cfg.mail.sendgrid_api_key) {
-      notified = await sendNotification({
-        apiKey: cfg.mail.sendgrid_api_key,
-        to: cfg.mail.notify_on_complete,
-        from: cfg.mail.from || `noreply@${cfg.site.domain}`,
-        subject: `Ghost ready: ${cfg.site.domain}`,
-        text: Object.entries(summary)
-          .map(([k, v]) => `${k}: ${v}`)
-          .join("\n"),
-      });
-    }
-    return json({ summary, notified });
+server.registerTool(
+  "next_steps",
+  {
+    title: "What the user does after ghostkit steps back",
+    description:
+      "Print the hand-off instructions: claim the admin account, upload a theme, wire SendGrid, re-enable the " +
+      "sign-in code, restart, and create the Admin API key for themeseed. ghostkit does none of these on " +
+      "purpose — they are one-time choices that belong to the site owner.",
+    inputSchema: { dir: z.string().optional() },
+  },
+  async ({ dir }) => {
+    const { cfg, ssh } = sshFor(dir);
+    const site = await resolveSite(ssh, cfg.site.domain);
+    const claimed = await setupStatus(ssh, site.port, cfg.site.domain);
+    return json({
+      url: `https://${cfg.site.domain}`,
+      admin_url: `https://${cfg.site.domain}/ghost/`,
+      owner_claimed: claimed,
+      steps: nextSteps(cfg.site.domain, site.ghostDir, site.shellUser),
+    });
   },
 );
 

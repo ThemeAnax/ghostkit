@@ -3,6 +3,7 @@ import { Ssh, shellQuote } from "./ssh.js";
 export interface SiteLayout {
   domain: string;
   port: number;
+  /** Where Ghost lives — the domain's own web folder. */
   ghostDir: string;
   docroot: string;
   sysUser: string;
@@ -12,15 +13,14 @@ export interface SiteLayout {
 }
 
 /**
- * Resolve where a site lives. Reads the port registry written by
- * ghost-site-enable, and ISPConfig for the rest. Kept separate from the Ghost
- * API layer so a non-ISPConfig host can grow its own resolver later.
+ * Resolve where a site lives: the port registry written by ghost-site-enable,
+ * and ISPConfig for the rest.
  */
 export async function resolveSite(ssh: Ssh, domain: string): Promise<SiteLayout> {
   const q = shellQuote(domain);
 
   const reg = await ssh.exec(`awk -F'\\t' -v d=${q} '$3==d{print $1"\\t"$4}' /etc/ghost/sites.tsv 2>/dev/null`);
-  const [portStr, ghostDirFromReg] = reg.stdout.trim().split("\t");
+  const [portStr, dirFromReg] = reg.stdout.trim().split("\t");
 
   const isp = await ssh.exec(
     `mysql -N -B -e "SELECT document_root,system_user,system_group FROM dbispconfig.web_domain WHERE domain=${q} LIMIT 1;" 2>/dev/null`,
@@ -28,8 +28,8 @@ export async function resolveSite(ssh: Ssh, domain: string): Promise<SiteLayout>
   const [docroot, sysUser, sysGroup] = isp.stdout.trim().split("\t");
   if (!docroot) {
     throw new Error(
-      `Could not resolve '${domain}' on this host. ` +
-        `Provision it first (sshmanager_provision_domain, or create it in ISPConfig).`,
+      `Could not resolve '${domain}' on this host. Create the website in ISPConfig first ` +
+        `(or with sshmanager_provision_domain).`,
     );
   }
 
@@ -41,11 +41,10 @@ export async function resolveSite(ssh: Ssh, domain: string): Promise<SiteLayout>
     throw new Error(`No active shell user for '${domain}'. Create one in ISPConfig with Chroot = None.`);
   }
 
-  const ghostDir = ghostDirFromReg || `${docroot}/web/ghost`;
   return {
     domain,
     port: Number(portStr) || 0,
-    ghostDir,
+    ghostDir: dirFromReg || `${docroot}/web`,
     docroot,
     sysUser,
     sysGroup,
@@ -54,17 +53,30 @@ export async function resolveSite(ssh: Ssh, domain: string): Promise<SiteLayout>
   };
 }
 
-/** The proxy block for the vhost. sshmanager re-injects ACME on its own. */
+/**
+ * The vhost block. Every line here is load-bearing — see the comments; each
+ * one corresponds to a way the site breaks without it.
+ */
 export function apacheDirectives(port: number): string {
   return [
-    "# Let's Encrypt ACME must not be proxied, or renewals break",
-    "ProxyPass /.well-known/ !",
-    "",
     "ProxyRequests Off",
     "ProxyPreserveHost On",
+    "",
+    "# Let's Encrypt ACME must never be proxied, or renewal fails silently ~60 days later",
+    "ProxyPass /.well-known/ !",
+    "",
     `ProxyPass        / http://127.0.0.1:${port}/ retry=0 timeout=120`,
     `ProxyPassReverse / http://127.0.0.1:${port}/`,
+    "",
+    "# Ghost only issues its Secure admin session cookie when it believes the request",
+    "# arrived over https, and mod_proxy does not set this header itself. Without it",
+    "# POST /ghost/api/admin/session/ returns 201 with no Set-Cookie and nobody can sign in.",
     'RequestHeader set X-Forwarded-Proto "https"',
+    "",
+    "RewriteEngine On",
+    "RewriteCond %{HTTP:Upgrade} websocket [NC]",
+    "RewriteCond %{HTTP:Connection} upgrade [NC]",
+    `RewriteRule ^/?(.*) ws://127.0.0.1:${port}/$1 [P,L]`,
     "",
     '<FilesMatch "^config\\.(production|development)\\.json$">',
     "    Require all denied",
@@ -74,9 +86,20 @@ export function apacheDirectives(port: number): string {
 
 /** Restart Ghost through the tenant's own systemd user manager — never root. */
 export async function restartGhost(ssh: Ssh, site: SiteLayout): Promise<string> {
-  await ssh.must(
-    `su - ${shellQuote(site.shellUser)} -c 'systemctl --user daemon-reload && systemctl --user restart ghost'`,
+  const uid = (await ssh.exec(`id -u ${shellQuote(site.sysUser)}`)).stdout.trim();
+  const env = `export XDG_RUNTIME_DIR=/run/user/${uid}; export DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/${uid}/bus;`;
+  await ssh.must(`su - ${shellQuote(site.shellUser)} -c ${shellQuote(`${env} systemctl --user daemon-reload && systemctl --user restart ghost`)}`);
+  const r = await ssh.exec(
+    `su - ${shellQuote(site.shellUser)} -c ${shellQuote(`${env} systemctl --user is-active ghost`)}`,
   );
-  const r = await ssh.exec(`su - ${shellQuote(site.shellUser)} -c 'systemctl --user is-active ghost'`);
   return r.stdout.trim();
+}
+
+/** Is the unit up? */
+export async function serviceState(ssh: Ssh, site: SiteLayout): Promise<string> {
+  const uid = (await ssh.exec(`id -u ${shellQuote(site.sysUser)}`)).stdout.trim();
+  const r = await ssh.exec(
+    `su - ${shellQuote(site.shellUser)} -c ${shellQuote(`export XDG_RUNTIME_DIR=/run/user/${uid}; systemctl --user is-active ghost`)}`,
+  );
+  return r.stdout.trim() || "unknown";
 }

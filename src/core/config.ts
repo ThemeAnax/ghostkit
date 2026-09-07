@@ -1,4 +1,5 @@
 import { readFileSync, writeFileSync, existsSync } from "node:fs";
+import { homedir } from "node:os";
 import { resolve } from "node:path";
 import { z } from "zod";
 
@@ -7,68 +8,63 @@ export const CONFIG_FILENAME = "ghostkit.config.json";
 export const ConfigSchema = z.object({
   site: z.object({
     domain: z.string(),
-    title: z.string().default(""),
-    /** "auto" resolves to 5 on MariaDB, 6 on MySQL 8. Never 6 on MariaDB. */
-    ghost_version: z.union([z.literal("auto"), z.literal("5"), z.literal("6")]).default("auto"),
+    /** Loopback port. resolve_server fills this from sshcon's Application Port. */
+    port: z.number().int().nullable().default(null),
   }),
   server: z.object({
-    /** Preferred when present: an sshcon alias such as "server8". */
+    /** The domain's own sshcon alias, e.g. "bastian-ghost". The only field an
+     *  sshcon user fills in; resolve_server derives the rest from it. */
     sshcon_alias: z.string().default(""),
+    /** Root-capable alias for the host, from sshcon's "Server Name".
+     *  Provisioning runs through this: the domain alias is an unprivileged
+     *  tenant login on the same box. */
+    exec_alias: z.string().default(""),
     host: z.string().default(""),
     user: z.string().default("root"),
     port: z.number().int().default(22),
     ssh_key_path: z.string().default(""),
-    /** Set to let sshmanager provision the domain instead of using an existing one. */
-    ispconfig_server_id: z.number().int().nullable().default(null),
   }),
-  owner: z.object({
-    name: z.string(),
-    email: z.string(),
-    /** Ghost enforces a 10 character minimum. */
-    password: z.string(),
-  }),
-  theme: z.object({
-    zip_url: z.string().default(""),
-    activate: z.boolean().default(true),
-  }),
+  /** Blank means ghostkit derives a name from the domain and generates a password. */
   database: z.object({
     name: z.string().default(""),
     user: z.string().default(""),
     password: z.string().default(""),
   }),
-  mail: z.object({
-    sendgrid_api_key: z.string().default(""),
-    from: z.string().default(""),
-    notify_on_complete: z.string().default(""),
-  }),
-  seed: z.object({
-    enabled: z.boolean().default(true),
-    post_count: z.number().int().default(12),
-  }),
 });
 
 export type Config = z.infer<typeof ConfigSchema>;
 
-/** Blank template written on first run for the user to fill in. */
+/**
+ * Blank template. Nothing is pre-answered: a value in this file is a decision
+ * the user made, never one ghostkit guessed for them.
+ */
 const BLANK = {
-  site: { domain: "", title: "", ghost_version: "auto" },
-  server: {
-    sshcon_alias: "",
-    host: "",
-    user: "root",
-    port: 22,
-    ssh_key_path: "",
-    ispconfig_server_id: null,
-  },
-  owner: { name: "", email: "", password: "" },
-  theme: { zip_url: "", activate: true },
+  _readme: [
+    "Set site.domain, then supply the server one of two ways:",
+    "(a) sshcon: set server.sshcon_alias to the domain's alias and run resolve_server —",
+    "    it fills the host, the root exec alias, the database and the port for you.",
+    "(b) no sshcon: fill server.host, server.user, server.ssh_key_path and the whole",
+    "    database block by hand — nothing can discover them for you.",
+    "Then run preflight, install_ghost, publish_site. ghostkit installs Ghost and stops:",
+    "you create the owner account yourself at https://<domain>/ghost/.",
+  ],
+  site: { domain: "", port: null },
+  server: { sshcon_alias: "" },
   database: { name: "", user: "", password: "" },
-  mail: { sendgrid_api_key: "", from: "", notify_on_complete: "" },
-  seed: { enabled: true, post_count: 12 },
 };
 
+/**
+ * Node's resolve() treats a leading "~" as a literal directory name — only a
+ * shell expands it — so "~/sites/x" would silently resolve under "<cwd>/~".
+ */
+function expandHome(dir: string): string {
+  if (dir === "~") return homedir();
+  if (dir.startsWith("~/")) return resolve(homedir(), dir.slice(2));
+  return dir;
+}
+
 export function configPath(dir = process.cwd()): string {
-  return resolve(dir, CONFIG_FILENAME);
+  return resolve(expandHome(dir), CONFIG_FILENAME);
 }
 
 export function initConfig(dir = process.cwd()): { path: string; created: boolean; needsFilling: string[] } {
@@ -82,10 +78,7 @@ function readRaw(path: string): unknown {
   return JSON.parse(readFileSync(path, "utf8"));
 }
 
-/**
- * Which fields still block a run. Reported in one pass so the user fills the
- * file once rather than discovering requirements one failure at a time.
- */
+/** Everything that still blocks a run, reported in one pass. */
 export function missingFields(raw: unknown): string[] {
   const c = raw as Record<string, Record<string, unknown>>;
   const missing: string[] = [];
@@ -93,18 +86,18 @@ export function missingFields(raw: unknown): string[] {
     if (v === undefined || v === null || v === "") missing.push(path);
   };
   need("site.domain", c?.site?.domain);
-  need("owner.name", c?.owner?.name);
-  need("owner.email", c?.owner?.email);
-  need("owner.password", c?.owner?.password);
 
-  // A server is reachable either by sshcon alias or by host — one or the other.
-  const hasAlias = Boolean(c?.server?.sshcon_alias);
-  const hasHost = Boolean(c?.server?.host);
-  if (!hasAlias && !hasHost) missing.push("server.sshcon_alias OR server.host");
-
-  const pw = c?.owner?.password;
-  if (typeof pw === "string" && pw.length > 0 && pw.length < 10) {
-    missing.push("owner.password (Ghost requires at least 10 characters)");
+  // Either sshcon can be asked for the connection details, or all of them —
+  // including the panel's database — are supplied by hand.
+  if (!c?.server?.sshcon_alias) {
+    if (!c?.server?.host) {
+      missing.push("server.sshcon_alias OR server.host");
+    } else {
+      need("server.user", c?.server?.user);
+      need("database.name", c?.database?.name);
+      need("database.user", c?.database?.user);
+      need("database.password", c?.database?.password);
+    }
   }
   return missing;
 }

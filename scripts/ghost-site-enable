@@ -1,27 +1,30 @@
 #!/bin/bash
-# ghost-site-enable — provision a Ghost tenant on an ISPConfig website (server8 pattern)
+# ghost-site-enable — install Ghost into an ISPConfig website's web folder.
 #
-# Enables one ISPConfig site to run Ghost under an unprivileged systemd --user
-# unit behind the site's existing Apache vhost + Let's Encrypt cert.
-# Requires: Node 22 LTS, ghost-cli (installed system-wide), jailkit NOT used for this site.
+# Ghost runs as an unprivileged `systemd --user` unit on a loopback port,
+# behind the site's existing Apache vhost and Let's Encrypt certificate.
+# It installs Ghost and nothing else: no owner account, no theme, no mail.
+# The first person to open /ghost/ creates the owner.
 set -euo pipefail
 
 REGISTRY=/etc/ghost/sites.tsv
 PORT_BASE=50001
-GHOST_VERSION=5          # Ghost 6 requires MySQL 8; this host runs MariaDB.
-DOMAIN=""; PORT=""; CREATE_DB=0; DO_INSTALL=0
+DOMAIN=""; PORT=""; GHOST_VERSION=""; WIPE=0
+DBNAME_OVERRIDE=""; DBUSER_OVERRIDE=""; DBPASS_OVERRIDE=""
 
 die() { echo "ERROR: $*" >&2; exit 1; }
 
 usage() {
   cat <<EOF
 Usage: ghost-site-enable --domain <fqdn> [options]
-  --domain <fqdn>     ISPConfig website to enable (required)
+  --domain <fqdn>     ISPConfig website to install into (required)
   --port <n>          Loopback port (default: next free from ${PORT_BASE})
-  --ghost-version <n> Ghost major version (default: ${GHOST_VERSION})
-  --create-db         Create the MariaDB database directly.
-                      Omit if you created it in the ISPConfig panel (preferred).
-  --install           Also run 'ghost install' as the tenant.
+  --ghost-version <n> Pin a Ghost major version (default: latest)
+  --wipe              Clear the web folder first. Required when it holds
+                      anything but ISPConfig defaults or a previous Ghost.
+  --dbname <name>     Database to use (default: derived from the domain)
+  --dbuser <user>     Database user (default: same as --dbname)
+  --dbpass <pass>     Password for that user
 EOF
   exit 1
 }
@@ -31,16 +34,15 @@ while [ $# -gt 0 ]; do
     --domain) DOMAIN="$2"; shift 2;;
     --port) PORT="$2"; shift 2;;
     --ghost-version) GHOST_VERSION="$2"; shift 2;;
-    --create-db) CREATE_DB=1; shift;;
-    --install) DO_INSTALL=1; shift;;
+    --wipe) WIPE=1; shift;;
+    --dbname) DBNAME_OVERRIDE="$2"; shift 2;;
+    --dbuser) DBUSER_OVERRIDE="$2"; shift 2;;
+    --dbpass) DBPASS_OVERRIDE="$2"; shift 2;;
     *) usage;;
   esac
 done
 [ -n "$DOMAIN" ] || usage
 [ "$(id -u)" = 0 ] || die "must run as root"
-
-command -v ghost >/dev/null || die "ghost-cli not installed (npm i -g ghost-cli)"
-node -v | grep -qE '^v22\.' || die "Node 22 LTS required; found $(node -v)"
 
 # ---- resolve the site from ISPConfig ----
 read -r DOMAIN_ID DOCROOT SYSUSER SYSGROUP < <(
@@ -61,22 +63,26 @@ CHROOT="$(mysql -N -B -e "SELECT chroot FROM dbispconfig.shell_user
   Set Chroot=None on this shell user in ISPConfig, then re-run."
 
 UID_N="$(id -u "$SYSUSER")"
-GHOSTDIR="${DOCROOT}/web/ghost"
+WEBDIR="${DOCROOT}/web"
 UNITDIR="${DOCROOT}/.config/systemd/user"
+
+# Resolve node as the TENANT sees it. Checking root's PATH proves nothing:
+# ghost runs as the shell user, and the unit needs an absolute path.
+NODE_BIN="$(su - "$SHELLUSER" -c 'command -v node' 2>/dev/null || true)"
+[ -n "$NODE_BIN" ] || die "node is not on ${SHELLUSER}'s PATH"
+su - "$SHELLUSER" -c 'command -v ghost' >/dev/null 2>&1 \
+  || die "ghost-cli is not on ${SHELLUSER}'s PATH (npm i -g ghost-cli)"
 
 # ---- allocate port ----
 mkdir -p /etc/ghost
 [ -f "$REGISTRY" ] || printf "# port\tuid\tsite\tdir\n" > "$REGISTRY"
 EXISTING="$(awk -v d="$DOMAIN" -F'\t' '$3==d{print $1; exit}' "$REGISTRY")"
 if [ -n "$EXISTING" ]; then
-  # already provisioned — reuse its port so re-running is idempotent
   if [ -z "$PORT" ]; then
     PORT="$EXISTING"
-    echo "==> ${DOMAIN} already registered on port ${PORT}, reusing"
   elif [ "$PORT" != "$EXISTING" ]; then
     die "${DOMAIN} is registered on port ${EXISTING} but --port ${PORT} was given.
-  Changing the port means editing config.production.json and the Apache directive.
-  Remove the registry row in ${REGISTRY} first if that is really what you want."
+  Remove its row from ${REGISTRY} first if that is really what you want."
   fi
 elif [ -z "$PORT" ]; then
   PORT=$PORT_BASE
@@ -92,38 +98,112 @@ usermod -aG ghost-users "$SYSUSER"
 usermod -aG ghost-users "$SHELLUSER"
 loginctl enable-linger "$SYSUSER"
 
-# ---- dirs. ISPConfig sets +i on the webroot; lift only to create .config once ----
+# ---- stop anything already serving this site ----
+if [ -f "${UNITDIR}/ghost.service" ]; then
+  su - "$SHELLUSER" -c "export XDG_RUNTIME_DIR=/run/user/${UID_N}; \
+    export DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/${UID_N}/bus; \
+    systemctl --user stop ghost.service" 2>/dev/null || true
+fi
+
+# ---- clear the web folder ----
+# ghost-cli refuses ANY non-empty directory, and that includes .well-known —
+# which must survive, or Let's Encrypt renewal fails silently ~60 days later.
+KEEP=$(mktemp -d /tmp/ghostkit-keep.XXXXXX)
+for k in .well-known error; do
+  [ -e "${WEBDIR}/${k}" ] && mv "${WEBDIR}/${k}" "${KEEP}/" || true
+done
+
+if [ -n "$(ls -A "$WEBDIR" 2>/dev/null)" ]; then
+  # Anything that is not an ISPConfig default or a previous Ghost is somebody's
+  # actual site. Refuse to delete that without an explicit --wipe.
+  UNEXPECTED=0
+  for f in "$WEBDIR"/* "$WEBDIR"/.[!.]*; do
+    [ -e "$f" ] || continue
+    case "$(basename "$f")" in
+      standard_index.html|index.html|favicon.ico|robots.txt|stats|webalizer|.htaccess) ;;
+      content|versions|current|config.production.json|config.development.json|.ghost-cli|ghost) ;;
+      *) UNEXPECTED=1; echo "    unexpected: $(basename "$f")" ;;
+    esac
+  done
+  if [ "$UNEXPECTED" = 1 ] && [ "$WIPE" != 1 ]; then
+    for k in "$KEEP"/* "$KEEP"/.[!.]*; do
+      [ -e "$k" ] && mv "$k" "${WEBDIR}/" || true
+    done
+    rmdir "$KEEP" 2>/dev/null || true
+    die "${WEBDIR} holds files that are not ISPConfig defaults or a Ghost install (listed above).
+  Re-run with --wipe if you really mean to delete them."
+  fi
+  echo "==> clearing ${WEBDIR}"
+  find "$WEBDIR" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
+fi
+
+chown "${SYSUSER}:${SYSGROUP}" "$WEBDIR"
+chmod 755 "$WEBDIR"
+
+# ---- unit dir. ISPConfig sets +i on the docroot; lift it only to create .config ----
 if [ ! -d "$UNITDIR" ]; then
-  chattr -i "$DOCROOT"
+  chattr -i "$DOCROOT" 2>/dev/null || true
   mkdir -p "$UNITDIR"
   chown -R "${SYSUSER}:${SYSGROUP}" "${DOCROOT}/.config"
-  chattr +i "$DOCROOT"
+  chattr +i "$DOCROOT" 2>/dev/null || true
 fi
-mkdir -p "$GHOSTDIR"
-chown "${SYSUSER}:${SYSGROUP}" "$GHOSTDIR"
-chmod 775 "$GHOSTDIR"
 
 # ---- database ----
-DBNAME="$(echo "c1${DOMAIN}" | tr -cd '[:alnum:]' | cut -c1-32)"
-DBUSER="$DBNAME"
+DBNAME="${DBNAME_OVERRIDE:-$(echo "c1${DOMAIN}" | tr -cd '[:alnum:]' | cut -c1-32)}"
+DBUSER="${DBUSER_OVERRIDE:-$DBNAME}"
 PWFILE="/etc/ghost/${DBNAME}.dbpass"
-if [ "$CREATE_DB" = 1 ]; then
-  if [ ! -f "$PWFILE" ]; then
-    openssl rand -base64 24 | tr -d '/+=' | head -c 24 > "$PWFILE"; chmod 600 "$PWFILE"
-  fi
-  DBPASS="$(cat "$PWFILE")"
-  mysql <<SQL
+if [ -n "$DBPASS_OVERRIDE" ]; then
+  printf '%s' "$DBPASS_OVERRIDE" > "$PWFILE"; chmod 600 "$PWFILE"
+elif [ ! -f "$PWFILE" ]; then
+  openssl rand -base64 24 | tr -d '/+=' | head -c 24 > "$PWFILE"; chmod 600 "$PWFILE"
+fi
+DBPASS="$(cat "$PWFILE")"
+mysql <<SQL
 CREATE DATABASE IF NOT EXISTS \`${DBNAME}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci;
 CREATE USER IF NOT EXISTS '${DBUSER}'@'127.0.0.1' IDENTIFIED BY '${DBPASS}';
 ALTER USER '${DBUSER}'@'127.0.0.1' IDENTIFIED BY '${DBPASS}';
 GRANT ALL PRIVILEGES ON \`${DBNAME}\`.* TO '${DBUSER}'@'127.0.0.1';
 FLUSH PRIVILEGES;
 SQL
-  echo "==> database ${DBNAME} ready (password: ${PWFILE})"
-  echo "    NOTE: created outside ISPConfig, so it will NOT appear in the panel."
-fi
+echo "==> database ${DBNAME} ready"
+
+# ---- install ----
+# --process local is REQUIRED. Without it ghost-cli leaves process=systemd and
+# every later `ghost` command shells out to `sudo systemctl`, which hangs
+# forever on a password prompt the tenant cannot answer.
+echo "==> installing Ghost ${GHOST_VERSION:-latest} as ${SHELLUSER}"
+su - "$SHELLUSER" -c "cd '${WEBDIR}' && ghost install ${GHOST_VERSION} \
+  --db mysql --dbhost 127.0.0.1 --dbuser '${DBUSER}' --dbpass '${DBPASS}' --dbname '${DBNAME}' \
+  --url 'https://${DOMAIN}' --port ${PORT} \
+  --process local \
+  --no-setup-mysql --no-setup-nginx --no-setup-ssl --no-setup-systemd --no-setup-linux-user \
+  --no-start --no-prompt"
+
+# 600, not 640: ISPConfig puts the web server user in the client group, so
+# group-read would hand Apache the database password.
+chmod 600 "${WEBDIR}/config.production.json"
+
+# Ghost emails a verification code on every staff sign-in. With no mail
+# configured that makes sign-in fail outright, locking the owner out of their
+# own site. Off until mail exists; the setup instructions say how to restore it.
+python3 - "$WEBDIR/config.production.json" <<'PY'
+import io, json, sys
+p = sys.argv[1]
+d = json.load(io.open(p))
+d.setdefault("security", {})["staffDeviceVerification"] = False
+io.open(p, "w").write(json.dumps(d, indent=2))
+PY
+chown "${SYSUSER}:${SYSGROUP}" "${WEBDIR}/config.production.json"
+chmod 600 "${WEBDIR}/config.production.json"
+
+# ---- restore what had to be moved out of the way ----
+for k in "$KEEP"/* "$KEEP"/.[!.]*; do
+  [ -e "$k" ] && mv "$k" "${WEBDIR}/" || true
+done
+rmdir "$KEEP" 2>/dev/null || true
 
 # ---- systemd user unit ----
+mkdir -p "$UNITDIR"
 cat > "${UNITDIR}/ghost.service" <<UNIT
 [Unit]
 Description=Ghost CMS - ${DOMAIN}
@@ -131,9 +211,9 @@ Documentation=https://ghost.org/docs/
 
 [Service]
 Type=simple
-WorkingDirectory=${GHOSTDIR}
+WorkingDirectory=${WEBDIR}
 Environment="NODE_ENV=production"
-ExecStart=/usr/bin/node current/index.js
+ExecStart=${NODE_BIN} current/index.js
 Restart=always
 RestartSec=5
 
@@ -143,51 +223,19 @@ UNIT
 chown "${SYSUSER}:${SYSGROUP}" "${UNITDIR}/ghost.service"
 chmod 644 "${UNITDIR}/ghost.service"
 
+su - "$SHELLUSER" -c "export XDG_RUNTIME_DIR=/run/user/${UID_N}; \
+  export DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/${UID_N}/bus; \
+  systemctl --user daemon-reload && systemctl --user enable --now ghost.service"
+
 # ---- registry ----
-awk -v d="$DOMAIN" -F'\t' '$3==d{f=1} END{exit !f}' "$REGISTRY" || \
-  printf "%s\t%s\t%s\t%s\n" "$PORT" "$UID_N" "$DOMAIN" "$GHOSTDIR" >> "$REGISTRY"
+# Rewrite the row rather than appending only when absent: the port or the
+# directory can change, and a stale row sends every later lookup to the
+# wrong place while looking perfectly healthy.
+TMPREG="$(mktemp)"
+awk -v d="$DOMAIN" -F'\t' '$3!=d' "$REGISTRY" > "$TMPREG"
+printf "%s\t%s\t%s\t%s\n" "$PORT" "$UID_N" "$DOMAIN" "$WEBDIR" >> "$TMPREG"
+mv "$TMPREG" "$REGISTRY"
+chmod 644 "$REGISTRY"
 
-# ---- optional install ----
-if [ "$DO_INSTALL" = 1 ]; then
-  [ -f "$PWFILE" ] || die "--install needs the DB password at ${PWFILE} (use --create-db, or write it there)"
-  su - "$SHELLUSER" -c "cd '${GHOSTDIR}' && ghost install ${GHOST_VERSION} \
-    --db mysql --dbhost 127.0.0.1 --dbuser '${DBUSER}' --dbpass '$(cat "$PWFILE")' --dbname '${DBNAME}' \
-    --url 'https://${DOMAIN}' --port ${PORT} \
-    --process local \
-    --no-setup-mysql --no-setup-nginx --no-setup-ssl --no-setup-systemd --no-setup-linux-user \
-    --no-start --no-prompt"
-  # --process local is REQUIRED. Without it ghost-cli leaves process=systemd and
-  # every ghost command runs `sudo systemctl ...`, which hangs on a password
-  # prompt the tenant cannot answer.
-  su - "$SHELLUSER" -c "export XDG_RUNTIME_DIR=/run/user/${UID_N}; \
-    export DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/${UID_N}/bus; \
-    systemctl --user daemon-reload && systemctl --user enable --now ghost.service"
-  # 600, not 640: ISPConfig puts www-data in the client group, so group-read
-  # would expose the DB password to the web server user.
-  chmod 600 "${GHOSTDIR}/config.production.json"
-fi
-
-cat <<EOF
-
-===============================================================
-Paste into ISPConfig -> Sites -> ${DOMAIN} -> Options -> Apache Directives
-===============================================================
-# Let's Encrypt ACME must not be proxied, or renewals break
-ProxyPass /.well-known/ !
-
-ProxyRequests Off
-ProxyPreserveHost On
-ProxyPass        / http://127.0.0.1:${PORT}/ retry=0 timeout=120
-ProxyPassReverse / http://127.0.0.1:${PORT}/
-RequestHeader set X-Forwarded-Proto "https"
-
-<FilesMatch "^config\.(production|development)\.json$">
-    Require all denied
-</FilesMatch>
-===============================================================
-
-Tenant (${SHELLUSER}) commands — no sudo required:
-  cd ${GHOSTDIR}
-  ghost update / ghost backup / ghost log / ghost doctor
-  systemctl --user restart ghost
-EOF
+INSTALLED="$(su - "$SHELLUSER" -c "cd '${WEBDIR}' && node -e \"console.log(require('./current/package.json').version)\"" 2>/dev/null || echo unknown)"
+echo "==> Ghost ${INSTALLED} installed in ${WEBDIR} on port ${PORT}"

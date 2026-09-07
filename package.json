@@ -1,7 +1,7 @@
 {
   "name": "@indianic/ghostkit",
-  "version": "0.1.0",
-  "description": "Provision Ghost with a theme on any SSH-reachable host. Hands the Admin API key to themeseed.",
+  "version": "0.2.0",
+  "description": "Install Ghost on any SSH-reachable ISPConfig host. No owner, no theme, no mail \u2014 you do those in Ghost.",
   "type": "module",
   "main": "./dist/index.js",
   "bin": {
@@ -45,7 +45,6 @@
     "ghost-cms",
     "mcp",
     "model-context-protocol",
-    "theme",
     "provisioning",
     "ispconfig",
     "devops"
