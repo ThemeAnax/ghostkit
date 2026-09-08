@@ -1,4 +1,7 @@
-import { randomBytes } from "node:crypto";
+import { createHmac, randomBytes } from "node:crypto";
+import { existsSync } from "node:fs";
+import { homedir } from "node:os";
+import { resolve as resolvePath } from "node:path";
 import { Ssh, shellQuote } from "./ssh.js";
 import type { SiteLayout } from "./site.js";
 
@@ -229,6 +232,271 @@ export async function waitForGhost(
     await new Promise((done) => setTimeout(done, 3000));
   }
   return false;
+}
+
+/** Ghost Admin API auth: HS256 JWT, kid = key id, secret is hex. */
+export function adminJwt(adminApiKey: string): string {
+  const [id, secret] = adminApiKey.split(":");
+  if (!id || !secret) throw new Error("admin API key must be in the form {id}:{secret}");
+  const now = Math.floor(Date.now() / 1000);
+  const b64 = (o: unknown) => Buffer.from(JSON.stringify(o)).toString("base64url");
+  const head = b64({ alg: "HS256", typ: "JWT", kid: id });
+  const body = b64({ iat: now, exp: now + 300, aud: "/admin/" });
+  const sig = createHmac("sha256", Buffer.from(secret, "hex"))
+    .update(`${head}.${body}`)
+    .digest("base64url");
+  return `${head}.${body}.${sig}`;
+}
+
+/**
+ * The headers every loopback admin call needs. X-Forwarded-Proto is not
+ * optional: Ghost's session cookie is Secure, and express-session refuses to
+ * ISSUE a Secure cookie on a connection it believes is plain http — which
+ * every loopback call is. In production the vhost sets it; here we must.
+ */
+function adminHeaders(domain: string): string {
+  return (
+    `-H ${shellQuote("Content-Type: application/json")} ` +
+    `-H ${shellQuote(`Host: ${domain}`)} ` +
+    `-H ${shellQuote("Origin: https://" + domain)} ` +
+    `-H ${shellQuote("X-Forwarded-Proto: https")} `
+  );
+}
+
+/** Sign in as the owner and hand back the session cookie, replayed by hand. */
+async function ownerCookie(
+  ssh: Ssh,
+  port: number,
+  domain: string,
+  owner: { email: string; password: string },
+): Promise<string> {
+  const hdr = "/tmp/ghostkit-session-headers.txt";
+  const body = JSON.stringify({ username: owner.email, password: owner.password });
+  const login = await ssh.exec(
+    `rm -f ${hdr}; curl -sS -D ${hdr} -X POST ${adminHeaders(domain)}` +
+      `--data ${shellQuote(body)} ` +
+      `-w '\\n%{http_code}' ${shellQuote(`http://127.0.0.1:${port}/ghost/api/admin/session/`)}`,
+  );
+  const code = login.stdout.trim().split("\n").pop();
+  if (code !== "201" && code !== "200") {
+    throw new Error(`session login failed (${code}): ${login.stdout.slice(0, 300)}`);
+  }
+  // curl will not SEND a Secure cookie over http either, so a cookie jar
+  // silently yields an unauthenticated request. Replay it explicitly.
+  const cookie = (
+    await ssh.must(
+      `sed -n 's/^[Ss]et-[Cc]ookie: *\\(ghost-admin-api-session=[^;]*\\).*/\\1/p' ${hdr} | head -1`,
+    )
+  ).trim();
+  await ssh.exec(`rm -f ${hdr}`);
+  if (!cookie) throw new Error("Ghost accepted the login but issued no session cookie.");
+  return cookie;
+}
+
+type Integration = { name?: string; api_keys?: Array<{ id: string; secret: string; type: string }> };
+
+/**
+ * Create (or reuse) a custom integration and return its Admin API key as
+ * {id}:{secret} — the form themeseed expects. Uses the public Admin API rather
+ * than inserting rows, so it survives Ghost upgrades.
+ */
+export async function createAdminKey(
+  ssh: Ssh,
+  port: number,
+  domain: string,
+  owner: { email: string; password: string },
+  integrationName = "themeseed",
+): Promise<string> {
+  const cookie = await ownerCookie(ssh, port, domain, owner);
+  const auth = `${adminHeaders(domain)}-H ${shellQuote(`Cookie: ${cookie}`)} `;
+
+  /**
+   * Ghost returns an ADMIN key's secret already as {id}:{secret} (89 chars).
+   * Composing it again would double the id and produce a key that
+   * authenticates nowhere. Content keys are a bare secret, hence the fallback.
+   */
+  const adminKeyOf = (i?: Integration): string | null => {
+    const k = i?.api_keys?.find((x) => x.type === "admin");
+    if (!k) return null;
+    return k.secret.includes(":") ? k.secret : `${k.id}:${k.secret}`;
+  };
+
+  // Re-running must not pile up duplicate integrations.
+  const listed = await ssh.exec(
+    `curl -sS ${auth}${shellQuote(`http://127.0.0.1:${port}/ghost/api/admin/integrations/?include=api_keys`)}`,
+  );
+  try {
+    const found = (JSON.parse(listed.stdout).integrations as Integration[] | undefined)?.find(
+      (i) => i.name === integrationName,
+    );
+    const existing = adminKeyOf(found);
+    if (existing) return existing;
+  } catch {
+    // Not listable — fall through and create one.
+  }
+
+  const created = await ssh.exec(
+    `curl -sS -X POST ${auth}` +
+      `--data ${shellQuote(JSON.stringify({ integrations: [{ name: integrationName }] }))} ` +
+      `${shellQuote(`http://127.0.0.1:${port}/ghost/api/admin/integrations/`)}`,
+  );
+  const key = adminKeyOf((JSON.parse(created.stdout) as { integrations?: Integration[] }).integrations?.[0]);
+  if (!key) throw new Error(`could not read admin key: ${created.stdout.slice(0, 300)}`);
+  return key;
+}
+
+/** Upload a file to a multipart admin endpoint and return the parsed body. */
+async function multipart(
+  ssh: Ssh,
+  port: number,
+  domain: string,
+  adminApiKey: string,
+  path: string,
+  remoteFile: string,
+  field = "file",
+): Promise<string> {
+  const r = await ssh.exec(
+    `curl -sS -X POST ` +
+      `-H ${shellQuote(`Authorization: Ghost ${adminJwt(adminApiKey)}`)} ` +
+      `-H ${shellQuote(`Host: ${domain}`)} ` +
+      `-H ${shellQuote("X-Forwarded-Proto: https")} ` +
+      `-F ${shellQuote(`${field}=@${remoteFile}`)} ` +
+      `${shellQuote(`http://127.0.0.1:${port}${path}`)}`,
+    { timeoutMs: 180_000 },
+  );
+  return r.stdout;
+}
+
+/**
+ * Download or upload a theme zip, install it, and activate it.
+ * `source` is an http(s) URL or a path on the machine running ghostkit.
+ */
+export async function installTheme(
+  ssh: Ssh,
+  port: number,
+  domain: string,
+  adminApiKey: string,
+  source: string,
+  activate = true,
+): Promise<{ name: string; active: boolean }> {
+  // Ghost names the installed theme after the uploaded FILE, so the zip's own
+  // basename has to survive the trip — uploading as "ghostkit-theme.zip"
+  // installs a theme called "ghostkit-theme".
+  const isUrl = /^https?:\/\//i.test(source);
+  const rawName = (isUrl ? new URL(source).pathname : source).split("/").pop() || "";
+  const safeName = rawName.replace(/[^A-Za-z0-9._-]/g, "") || "theme.zip";
+  const tmpDir = "/tmp/ghostkit-theme";
+  const tmp = `${tmpDir}/${safeName}`;
+  await ssh.must(`rm -rf ${tmpDir} && mkdir -p ${tmpDir}`);
+
+  if (isUrl) {
+    await ssh.must(`curl -fsSL -o ${tmp} ${shellQuote(source)}`, { timeoutMs: 180_000 });
+  } else {
+    const bare = source.replace(/^file:\/\//, "");
+    const local = resolvePath(bare.startsWith("~/") ? bare.replace("~", homedir()) : bare);
+    if (!existsSync(local)) {
+      throw new Error(`theme zip not found: ${local} (give a local path or an http(s) URL)`);
+    }
+    await ssh.upload(local, tmp);
+  }
+
+  const body = await multipart(ssh, port, domain, adminApiKey, "/ghost/api/admin/themes/upload/", tmp);
+  await ssh.exec(`rm -rf ${tmpDir}`);
+
+  const theme = (JSON.parse(body) as { themes?: Array<{ name: string; active: boolean }> }).themes?.[0];
+  if (!theme) throw new Error(`theme upload failed: ${body.slice(0, 400)}`);
+  if (!activate) return { name: theme.name, active: theme.active };
+
+  // A fresh JWT: the upload can outlive the 5 minute token.
+  const act = await ssh.curlLoopback(port, domain, `/ghost/api/admin/themes/${theme.name}/activate/`, {
+    method: "PUT",
+    headers: { Authorization: `Ghost ${adminJwt(adminApiKey)}` },
+  });
+  if (act.status < 200 || act.status >= 300) {
+    throw new Error(`theme activate failed (${act.status}): ${act.body.slice(0, 300)}`);
+  }
+  return { name: theme.name, active: true };
+}
+
+/** Upload an image already sitting on the host; returns the URL Ghost stores. */
+export async function uploadImage(
+  ssh: Ssh,
+  port: number,
+  domain: string,
+  adminApiKey: string,
+  remoteFile: string,
+): Promise<string> {
+  const body = await multipart(ssh, port, domain, adminApiKey, "/ghost/api/admin/images/upload/", remoteFile);
+  const url = (JSON.parse(body) as { images?: Array<{ url: string }> }).images?.[0]?.url;
+  if (!url) throw new Error(`image upload failed: ${body.slice(0, 300)}`);
+  return url;
+}
+
+/** PUT site settings. Values are strings; navigation is a JSON string. */
+export async function updateSettings(
+  ssh: Ssh,
+  port: number,
+  domain: string,
+  adminApiKey: string,
+  values: Record<string, string>,
+): Promise<string[]> {
+  const settings = Object.entries(values).map(([key, value]) => ({ key, value }));
+  const r = await ssh.curlLoopback(port, domain, "/ghost/api/admin/settings/", {
+    method: "PUT",
+    headers: { Authorization: `Ghost ${adminJwt(adminApiKey)}` },
+    json: { settings },
+  });
+  if (r.status < 200 || r.status >= 300) {
+    throw new Error(`settings update failed (${r.status}): ${r.body.slice(0, 300)}`);
+  }
+  return Object.keys(values);
+}
+
+/** Upload a theme's routes.yaml, when it ships one. */
+export async function uploadRoutes(
+  ssh: Ssh,
+  port: number,
+  domain: string,
+  adminApiKey: string,
+  remoteFile: string,
+): Promise<boolean> {
+  const body = await multipart(
+    ssh,
+    port,
+    domain,
+    adminApiKey,
+    "/ghost/api/admin/settings/routes/yaml/",
+    remoteFile,
+    "routes",
+  );
+  return !/"errors"/.test(body);
+}
+
+/**
+ * Point Ghost's transactional mail at SendGrid using ghost-cli, which writes
+ * the nested config keys itself — no JSON editing, and it survives upgrades.
+ * Covers staff invites and member signup/login only: Ghost sends newsletters
+ * through Mailgun exclusively.
+ */
+export async function configureMail(
+  ssh: Ssh,
+  site: SiteLayout,
+  opts: { apiKey: string; from: string },
+): Promise<void> {
+  const cfg = [
+    "mail.transport SMTP",
+    "mail.options.host smtp.sendgrid.net",
+    "mail.options.port 587",
+    "mail.options.auth.user apikey",
+    `mail.options.auth.pass ${shellQuote(opts.apiKey)}`,
+    `mail.from ${shellQuote(opts.from)}`,
+  ]
+    .map((c) => `ghost config ${c}`)
+    .join(" && ");
+  await ssh.must(`su - ${shellQuote(site.shellUser)} -c ${shellQuote(`cd ${site.ghostDir} && ${cfg}`)}`);
+  // ghost-cli rewrites the file, so re-assert the mode: ISPConfig puts the web
+  // server user in the client group and 640 would leak the database password.
+  await ssh.must(`chmod 600 ${shellQuote(`${site.ghostDir}/config.production.json`)}`);
 }
 
 /** The Ghost version actually installed, read from the live symlink. */

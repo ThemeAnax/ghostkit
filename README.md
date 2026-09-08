@@ -17,20 +17,47 @@ Ships as an **MCP server** and a **CLI**.
 
 ## What it does, and what it deliberately doesn't
 
-| ghostkit does | you do, in Ghost |
+| ghostkit does | left to you |
 |---|---|
-| Create the database and user | Upload your theme |
-| Allocate a free loopback port | Configure SendGrid |
-| Install the **latest** Ghost | Create the Admin API key |
+| Create the database and user | Write the articles — that's [themeseed](https://github.com/ThemeAnax/themeseed) |
+| Allocate a free loopback port | |
+| Install the **latest** Ghost | |
 | **Claim the owner account, over loopback** | |
+| Create the Admin API key for themeseed | |
+| Upload and activate your theme, plus its `routes.yaml` | |
+| Generate a favicon, wordmark, accent colour and navigation | |
+| Wire SendGrid for transactional mail | |
 | Run it under `systemd --user`, no sudo for the tenant | |
 | Emit the vhost directives | |
 
 Claiming the owner is automated because it is not really a choice — it is a race. Ghost's
-setup endpoint is unauthenticated and fires exactly once, so the safe moment to call it is
-while Ghost is still bound to `127.0.0.1` and nobody else can reach it. Themes and mail
-stay manual: those are genuine one-time decisions, and each one was a way for the install
-to fail.
+setup endpoint is unauthenticated and fires exactly once, so the only safe moment to call
+it is while Ghost is still bound to `127.0.0.1` and nobody else can reach it.
+
+## Installing it into your editors
+
+ghostkit registers itself. Ask your agent to run `detect_editors`, pick the ones you want,
+and it calls `register_editors`:
+
+| Editor | Config it writes |
+|---|---|
+| Claude Code | `~/.claude.json` |
+| Codex | `~/.codex/config.toml` (TOML section, rest of the file untouched) |
+| Cursor | `~/.cursor/mcp.json` |
+| Windsurf | `~/.codeium/windsurf/mcp_config.json` |
+| Gemini CLI | `~/.gemini/settings.json` |
+| Antigravity | via its own `agy mcp add` |
+| Zed | `~/.config/zed/settings.json` (`context_servers`) |
+| VS Code | `~/Library/.../Code/User/mcp.json` |
+
+Every file is backed up first, because rewriting JSON drops comments.
+
+**Updates take care of themselves.** Registration uses
+`npx -y --package @indianic/ghostkit@latest ghostkit-mcp`, which re-resolves the registry
+on every launch — so restarting your editor is the update. `version` shows what is running
+against what is published. The server never rewrites its own code mid-session; that would
+change tool behaviour under a running agent and break every editor at once on a bad
+release.
 
 ## Quick start
 
@@ -63,12 +90,23 @@ The whole file, when you use sshcon:
 
 ```json
 {
-  "site":   { "domain": "blog.example.com", "title": "My Blog", "port": null },
-  "admin":  { "name": "Jane Doe", "email": "jane@example.com", "password": "" },
-  "server": { "sshcon_alias": "blog-example" },
+  "site":     { "domain": "blog.example.com", "title": "My Blog", "port": null },
+  "admin":    { "name": "Jane Doe", "email": "jane@example.com", "password": "", "api_key": "" },
+  "theme":    { "source": "~/themes/bastian.zip", "activate": true },
+  "branding": { "description": "", "accent_color": "", "generate_assets": true, "navigation": [] },
+  "mail":     { "sendgrid_api_key": "", "from": "" },
+  "author":   { "name": "", "email": "" },
+  "server":   { "sshcon_alias": "blog-example" },
   "database": { "name": "", "user": "", "password": "" }
 }
 ```
+
+Everything except `site.domain`, `admin.name` and `admin.email` is optional:
+
+- `theme.source` — a local zip path or an http(s) URL. Blank keeps Ghost's default theme.
+- `branding.accent_color` — blank derives a stable colour from the title.
+- `author` — byline for generated content; themeseed asks per blog without it.
+- `admin.api_key` and `admin.password` are **written by** ghostkit, not filled in by you.
 
 Leave `admin.password` blank and ghostkit generates a 20-character one, writes it back to
 this file, and returns it in the tool result. Give it one instead if you'd rather; Ghost
@@ -95,9 +133,15 @@ decision you made, never one ghostkit guessed for you.
 | `preflight` | Host readiness matrix + fix commands |
 | `install_ghost` | Install the latest Ghost, then claim the owner over loopback |
 | `create_admin` | Claim the owner on its own — retry, or an older install |
+| `create_admin_key` | Admin API key as `{id}:{secret}`, saved to `admin.api_key` |
+| `install_theme` | Upload + activate a theme, and its `routes.yaml` |
+| `apply_branding` | Favicon, wordmark, accent colour, navigation |
+| `configure_mail` | SendGrid for transactional mail |
 | `publish_site` | Return the vhost directives; you apply them |
 | `status` | Is it up, and **has anyone claimed it yet?** |
 | `next_steps` | The hand-off instructions |
+| `detect_editors` / `register_editors` | Install ghostkit into your editors |
+| `version` | Running vs published |
 
 ## Why the order matters
 

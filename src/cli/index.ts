@@ -7,7 +7,7 @@ import { preflight, setupStatus, installedVersion } from "../core/ghost.js";
 import { resolveSite, apacheDirectives, serviceState } from "../core/site.js";
 
 const program = new Command();
-program.name("ghostkit").description("Install Ghost on any SSH-reachable ISPConfig host").version("0.3.0");
+program.name("ghostkit").description("Install Ghost on any SSH-reachable ISPConfig host").version("0.4.0");
 
 program
   .command("init")

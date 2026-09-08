@@ -24,8 +24,42 @@ export const ConfigSchema = z.object({
       email: z.string().default(""),
       /** Blank means ghostkit generates one and writes it back here. */
       password: z.string().default(""),
+      /** {id}:{secret}, written by create_admin_key. This is a full admin credential. */
+      api_key: z.string().default(""),
     })
-    .default({ name: "", email: "", password: "" }),
+    .default({ name: "", email: "", password: "", api_key: "" }),
+  /** Blank source installs Ghost's bundled default; otherwise a path or URL. */
+  theme: z
+    .object({
+      source: z.string().default(""),
+      activate: z.boolean().default(true),
+    })
+    .default({ source: "", activate: true }),
+  branding: z
+    .object({
+      description: z.string().default(""),
+      /** Blank derives a stable colour from the title. */
+      accent_color: z.string().default(""),
+      generate_assets: z.boolean().default(true),
+      navigation: z
+        .array(z.object({ label: z.string(), url: z.string() }))
+        .default([]),
+    })
+    .default({ description: "", accent_color: "", generate_assets: true, navigation: [] }),
+  /** SendGrid covers transactional mail only; Ghost sends newsletters via Mailgun. */
+  mail: z
+    .object({
+      sendgrid_api_key: z.string().default(""),
+      from: z.string().default(""),
+    })
+    .default({ sendgrid_api_key: "", from: "" }),
+  /** Byline for generated content. Optional; themeseed asks per blog without it. */
+  author: z
+    .object({
+      name: z.string().default(""),
+      email: z.string().default(""),
+    })
+    .default({ name: "", email: "" }),
   server: z.object({
     /** The domain's own sshcon alias, e.g. "bastian-ghost". The only field an
      *  sshcon user fills in; resolve_server derives the rest from it. */
@@ -64,7 +98,11 @@ const BLANK = {
     "returns it. Then run preflight, install_ghost, publish_site.",
   ],
   site: { domain: "", title: "", port: null },
-  admin: { name: "", email: "", password: "" },
+  admin: { name: "", email: "", password: "", api_key: "" },
+  theme: { source: "", activate: true },
+  branding: { description: "", accent_color: "", generate_assets: true, navigation: [] },
+  mail: { sendgrid_api_key: "", from: "" },
+  author: { name: "", email: "" },
   server: { sshcon_alias: "" },
   database: { name: "", user: "", password: "" },
 };

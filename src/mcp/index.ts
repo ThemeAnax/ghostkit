@@ -16,13 +16,19 @@ import {
   generatePassword,
   installedVersion,
   waitForGhost,
+  createAdminKey,
+  installTheme,
+  uploadRoutes,
+  configureMail,
 } from "../core/ghost.js";
 import type { SiteLayout } from "../core/site.js";
-import { resolveSite, apacheDirectives, serviceState } from "../core/site.js";
+import { resolveSite, apacheDirectives, serviceState, restartGhost } from "../core/site.js";
 import { readSshconServer } from "../core/sshcon.js";
+import { applyBranding } from "../core/branding.js";
+import { EDITORS, detectAll, registerEditor, latestVersion, launchCommand, PACKAGE } from "../core/editors.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
-const VERSION = "0.3.0";
+const VERSION = "0.4.0";
 
 const server = new McpServer({ name: "ghostkit", version: VERSION });
 
@@ -85,23 +91,16 @@ function nextSteps(domain: string, ghostDir: string, shellUser: string) {
     "1_sign_in": `Sign in at https://${domain}/ghost/ with admin.email and admin.password from your ` +
       `ghostkit.config.json. ghostkit already claimed the owner account over loopback, before the site was ` +
       `public, so nobody else could take it. Change the password once you are in.`,
-    "2_install_a_theme": `Ghost admin -> Settings -> Design -> Change theme -> Upload theme, and pick your zip.`,
-    "3_set_up_email_sendgrid": [
-      `Transactional mail (member logins, staff invites, password resets) needs SMTP.`,
-      `As ${shellUser}:  cd ${ghostDir} && ghost config mail.transport SMTP \\`,
-      `  && ghost config mail.options.service SendGrid \\`,
-      `  && ghost config mail.options.auth.user apikey \\`,
-      `  && ghost config mail.options.auth.pass '<SG.your-key>' \\`,
-      `  && ghost config mail.from 'noreply@${domain}'`,
-      `Newsletters (bulk mail) are Mailgun-only in Ghost; SendGrid cannot send them.`,
-    ].join("\n"),
-    "4_re_enable_the_sign_in_code": `ghostkit set security.staffDeviceVerification=false in ` +
-      `${ghostDir}/config.production.json, because Ghost emails a sign-in code and, with no mail ` +
-      `configured, that locks you out of your own site. Once step 3 works, set it back to true.`,
+    "2_theme": `If you did not set theme.source, the site is on Ghost's default theme. Set it and run ` +
+      `install_theme, or upload one in Settings -> Design.`,
+    "3_email": `Run configure_mail with a SendGrid key for transactional mail — member logins, staff invites, ` +
+      `password resets. Newsletters are Mailgun-only in Ghost; no SendGrid key changes that.`,
+    "4_re_enable_the_sign_in_code": `ghostkit set security.staffDeviceVerification to false at install, because ` +
+      `Ghost emails a code on every sign-in and with no mail configured that locks you out of your own site. ` +
+      `Once step 3 works, set it back to true in ${ghostDir}/config.production.json and restart.`,
     "5_restart": `As ${shellUser}:  systemctl --user restart ghost   (no sudo needed)`,
-    "6_admin_api_key_for_themeseed": `Ghost admin -> Settings -> Integrations -> Add custom integration. ` +
-      `Copy the Admin API key ({id}:{secret}) and give it to themeseed's add_site. ` +
-      `themeseed rejects Content API keys.`,
+    "6_themeseed": `admin.api_key in your config is the Admin API key, as {id}:{secret}. Hand it to themeseed's ` +
+      `add_site so it can write articles. Run create_admin_key if it is still blank.`,
   };
 }
 
@@ -341,6 +340,263 @@ server.registerTool(
       note: owner.alreadySetUp
         ? "This site was already claimed. Ghost's setup endpoint works once, so no password was set here — sign in with the account that claimed it, or reset it from Ghost."
         : undefined,
+    });
+  },
+);
+
+/** Read-modify-write the config, preserving 0600. */
+function patchConfig(dir: string | undefined, mutate: (raw: Record<string, any>) => void): void {
+  const path = configPath(dir);
+  const raw = JSON.parse(readFileSync(path, "utf8")) as Record<string, any>;
+  mutate(raw);
+  writeConfigFile(path, raw);
+}
+
+server.registerTool(
+  "create_admin_key",
+  {
+    title: "Create the Admin API key for themeseed",
+    description:
+      "Sign in as the owner, create (or reuse) a custom integration, and return its Admin API key as " +
+      "{id}:{secret} — the form themeseed's add_site expects; it rejects Content API keys. The key is saved to " +
+      "admin.api_key in the config. Uses the public Admin API rather than touching the database, so it survives " +
+      "Ghost upgrades. Idempotent: an integration of the same name is reused, never duplicated.",
+    inputSchema: {
+      dir: z.string().optional(),
+      name: z.string().optional().describe('Integration name. Default "themeseed".'),
+    },
+  },
+  async ({ dir, name }) => {
+    const { cfg, ssh } = sshFor(dir);
+    const site = await resolveSite(ssh, cfg.site.domain);
+    if (!cfg.admin.password) {
+      return json({ ok: false, error: "admin.password is empty — run create_admin first, or fill it in." });
+    }
+    const key = await createAdminKey(
+      ssh,
+      site.port,
+      cfg.site.domain,
+      { email: cfg.admin.email, password: cfg.admin.password },
+      name ?? "themeseed",
+    );
+    patchConfig(dir, (raw) => {
+      raw.admin = { ...(raw.admin ?? {}), api_key: key };
+    });
+    return json({
+      ok: true,
+      integration: name ?? "themeseed",
+      admin_api_key: key,
+      saved_to: "admin.api_key",
+      note: "This is a full admin credential. The config is 0600; treat it like the owner password.",
+    });
+  },
+);
+
+server.registerTool(
+  "install_theme",
+  {
+    title: "Upload and activate a theme",
+    description:
+      "Install a theme from theme.source — an http(s) URL, or a path to a zip on THIS machine — and activate " +
+      "it. Leave theme.source blank to keep Ghost's bundled default. Also uploads the theme's routes.yaml when " +
+      "it ships one. Run this before seeding: themeseed reads the ACTIVE theme, so without it content is " +
+      "generated against Casper.",
+    inputSchema: {
+      dir: z.string().optional(),
+      source: z.string().optional().describe("Overrides theme.source. URL or local zip path."),
+      activate: z.boolean().optional(),
+    },
+  },
+  async ({ dir, source, activate }) => {
+    const { cfg, ssh } = sshFor(dir);
+    const src = source || cfg.theme.source;
+    if (!src) {
+      return json({
+        ok: true,
+        skipped: "No theme.source set — keeping Ghost's bundled default theme.",
+      });
+    }
+    if (!cfg.admin.api_key) {
+      return json({ ok: false, error: "admin.api_key is empty — run create_admin_key first." });
+    }
+    const site = await resolveSite(ssh, cfg.site.domain);
+    const theme = await installTheme(
+      ssh,
+      site.port,
+      cfg.site.domain,
+      cfg.admin.api_key,
+      src,
+      activate ?? cfg.theme.activate,
+    );
+
+    // A theme that ships routes.yaml expects it: without it, collection URLs
+    // the templates link to simply 404.
+    let routes: string | undefined;
+    const found = await ssh.exec(
+      `ls ${shellQuote(`${site.ghostDir}/content/themes/${theme.name}/routes.yaml`)} 2>/dev/null || true`,
+    );
+    if (found.stdout.trim()) {
+      try {
+        const ok = await uploadRoutes(ssh, site.port, cfg.site.domain, cfg.admin.api_key, found.stdout.trim());
+        routes = ok ? "uploaded" : "rejected by Ghost";
+      } catch (e) {
+        routes = `failed: ${(e as Error).message}`;
+      }
+    }
+    return json({ ok: true, theme, routes_yaml: routes ?? "none shipped with this theme" });
+  },
+);
+
+server.registerTool(
+  "configure_mail",
+  {
+    title: "Point Ghost's transactional mail at SendGrid",
+    description:
+      "Write the SMTP settings with ghost-cli, which handles the nested config keys itself, then restart. " +
+      "Covers staff invites and member signup/login only — Ghost sends NEWSLETTERS through Mailgun " +
+      "exclusively, and no SendGrid key changes that. Once mail works you can turn " +
+      "security.staffDeviceVerification back on.",
+    inputSchema: {
+      dir: z.string().optional(),
+      sendgrid_api_key: z.string().optional().describe("Overrides mail.sendgrid_api_key."),
+      from: z.string().optional().describe('Sender, e.g. "Blog <noreply@example.com>".'),
+    },
+  },
+  async ({ dir, sendgrid_api_key, from }) => {
+    const { cfg, ssh } = sshFor(dir);
+    const apiKey = sendgrid_api_key || cfg.mail.sendgrid_api_key;
+    if (!apiKey) {
+      return json({ ok: false, error: "No SendGrid API key in mail.sendgrid_api_key or arguments." });
+    }
+    const site = await resolveSite(ssh, cfg.site.domain);
+    const sender = from || cfg.mail.from || `noreply@${cfg.site.domain}`;
+    await configureMail(ssh, site, { apiKey, from: sender });
+    const state = await restartGhost(ssh, site);
+    patchConfig(dir, (raw) => {
+      raw.mail = { ...(raw.mail ?? {}), sendgrid_api_key: apiKey, from: sender };
+    });
+    return json({
+      ok: true,
+      from: sender,
+      ghost: state,
+      warning: "Transactional mail only. Newsletters require Mailgun.",
+      next: `Sign-in codes can be re-enabled now: set security.staffDeviceVerification to true in ${site.ghostDir}/config.production.json and restart.`,
+    });
+  },
+);
+
+server.registerTool(
+  "apply_branding",
+  {
+    title: "Generate and apply icon, logo, accent colour and navigation",
+    description:
+      "Generate a favicon and wordmark from the site title and accent colour, upload them, and set title, " +
+      "description, accent colour and navigation. Assets are rasterised on the host using the sharp that Ghost " +
+      "already bundles, so ghostkit carries no image dependencies. A theme with no navigation renders an empty " +
+      "header, which reads as a broken install — this is what stops that.",
+    inputSchema: {
+      dir: z.string().optional(),
+      title: z.string().optional().describe("Overrides site.title."),
+      description: z.string().optional(),
+      accent_color: z.string().optional().describe('Hex, e.g. "#2F6FED". Blank derives one from the title.'),
+      generate_assets: z.boolean().optional(),
+    },
+  },
+  async ({ dir, title, description, accent_color, generate_assets }) => {
+    const { cfg, ssh } = sshFor(dir);
+    if (!cfg.admin.api_key) {
+      return json({ ok: false, error: "admin.api_key is empty — run create_admin_key first." });
+    }
+    const site = await resolveSite(ssh, cfg.site.domain);
+    const r = await applyBranding(ssh, site, cfg.admin.api_key, {
+      title: title || cfg.site.title || cfg.site.domain,
+      description: description || cfg.branding.description,
+      accentColor: accent_color || cfg.branding.accent_color,
+      navigation: cfg.branding.navigation,
+      generateAssets: generate_assets ?? cfg.branding.generate_assets,
+    });
+    return json({ ok: true, ...r });
+  },
+);
+
+server.registerTool(
+  "detect_editors",
+  {
+    title: "Which editors are installed, and is ghostkit registered in them",
+    description:
+      "Look for Claude Code, Codex, Cursor, Windsurf, Gemini CLI, Antigravity, Zed and VS Code, and report for " +
+      "each whether it is present, whether ghostkit is already registered, and what it currently launches. " +
+      "Read-only. Use this to ask the user which editors to register, then call register_editors.",
+    inputSchema: {},
+  },
+  async () => {
+    const all = await detectAll();
+    return json({
+      editors: all,
+      launch_command: launchCommand(),
+      note: "Registration uses npx with @latest, so every editor launch picks up the newest published version.",
+    });
+  },
+);
+
+server.registerTool(
+  "register_editors",
+  {
+    title: "Register ghostkit as an MCP server in the chosen editors",
+    description:
+      "Write the ghostkit MCP entry into each named editor's config, pinned to @latest so it self-updates on " +
+      "every launch. Each file is backed up first, because rewriting JSON drops any comments the user had. " +
+      "Antigravity is handled through its own `agy mcp add` CLI rather than by editing its file. Ask the user " +
+      "which editors they want before calling this.",
+    inputSchema: {
+      editors: z
+        .array(z.string())
+        .optional()
+        .describe('Editor ids from detect_editors, e.g. ["claude","cursor"]. Omit for every detected editor.'),
+      force: z.boolean().optional().describe("Rewrite even when already pointing at @latest."),
+    },
+  },
+  async ({ editors, force }) => {
+    const detected = await detectAll();
+    const wanted = editors?.length
+      ? EDITORS.filter((e) => editors.includes(e.id))
+      : EDITORS.filter((e) => detected.find((d) => d.id === e.id)?.detected);
+
+    if (!wanted.length) {
+      return json({ ok: false, error: "No matching editors.", available: detected.map((d) => d.id) });
+    }
+    const results = [];
+    for (const def of wanted) results.push(await registerEditor(def, { force }));
+    return json({
+      ok: results.every((r) => r.ok),
+      results,
+      restart_required: "Each editor loads MCP servers at startup — restart the ones you just changed.",
+    });
+  },
+);
+
+server.registerTool(
+  "version",
+  {
+    title: "Which ghostkit is running, and is there a newer one",
+    description:
+      "Report the running version and the newest published version, and how to update. When registered with " +
+      "npx and @latest, editors pick up new releases on their next launch, so 'update' usually just means " +
+      "restarting the editor.",
+    inputSchema: {},
+  },
+  async () => {
+    const latest = await latestVersion();
+    return json({
+      running: VERSION,
+      latest: latest ?? "could not reach the registry",
+      up_to_date: latest ? latest === VERSION : undefined,
+      how_to_update:
+        latest && latest !== VERSION
+          ? "Restart your editor: the npx @latest registration fetches it. To force now: npm i -g " +
+            `${PACKAGE}@latest, or re-run register_editors with force.`
+          : undefined,
+      package: PACKAGE,
     });
   },
 );
