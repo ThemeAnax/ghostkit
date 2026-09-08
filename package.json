@@ -1,6 +1,6 @@
 {
   "name": "@indianic/ghostkit",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "description": "Install Ghost on any SSH-reachable ISPConfig host and claim the owner before it goes public.",
   "type": "module",
   "main": "./dist/index.js",

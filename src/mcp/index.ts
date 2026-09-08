@@ -28,7 +28,7 @@ import { applyBranding } from "../core/branding.js";
 import { EDITORS, detectAll, registerEditor, latestVersion, launchCommand, PACKAGE } from "../core/editors.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
-const VERSION = "0.4.0";
+const VERSION = "0.4.1";
 
 const server = new McpServer({ name: "ghostkit", version: VERSION });
 
