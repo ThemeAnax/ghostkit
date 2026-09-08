@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "ghostkit": {
+      "command": "node",
+      "args": ["${CLAUDE_PLUGIN_ROOT}/plugin/ghostkit-mcp.mjs"]
+    }
+  }
+}

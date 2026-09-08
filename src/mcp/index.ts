@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
@@ -28,7 +28,7 @@ import { applyBranding } from "../core/branding.js";
 import { EDITORS, detectAll, registerEditor, latestVersion, launchCommand, PACKAGE } from "../core/editors.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
-const VERSION = "0.4.1";
+const VERSION = "0.5.0";
 
 const server = new McpServer({ name: "ghostkit", version: VERSION });
 
@@ -38,6 +38,28 @@ const json = (o: unknown) => text(JSON.stringify(o, null, 2));
 function sshFor(dir?: string) {
   const cfg = loadConfig(dir);
   return { cfg, ssh: new Ssh(cfg.server) };
+}
+
+/**
+ * Find scripts/ghost-site-enable. The server runs from three different layouts
+ * — dist/mcp/ when installed from npm, plugin/ as a single bundled file inside
+ * a Claude Code plugin, and src/mcp/ in development — so a single relative path
+ * would break two of them.
+ */
+function provisioningScript(): string {
+  const candidates = [
+    resolve(here, "../../scripts/ghost-site-enable"), // dist/mcp/  -> repo root
+    resolve(here, "../scripts/ghost-site-enable"), // plugin/    -> repo root
+    resolve(here, "scripts/ghost-site-enable"), // repo root itself
+    resolve(process.cwd(), "scripts/ghost-site-enable"),
+  ];
+  const found = candidates.find((p) => existsSync(p));
+  if (!found) {
+    throw new Error(
+      `Could not find scripts/ghost-site-enable. Looked in:\n  ${candidates.join("\n  ")}`,
+    );
+  }
+  return found;
 }
 
 /**
@@ -245,7 +267,7 @@ server.registerTool(
     }
 
     // Ship the script rather than assuming it is already on the host.
-    const script = readFileSync(resolve(here, "../../scripts/ghost-site-enable"), "utf8");
+    const script = readFileSync(provisioningScript(), "utf8");
     const b64 = Buffer.from(script).toString("base64");
     await ssh.must(
       `echo ${shellQuote(b64)} | base64 -d > /usr/local/sbin/ghost-site-enable && chmod +x /usr/local/sbin/ghost-site-enable`,

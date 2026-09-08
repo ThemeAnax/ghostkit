@@ -34,7 +34,30 @@ Claiming the owner is automated because it is not really a choice — it is a ra
 setup endpoint is unauthenticated and fires exactly once, so the only safe moment to call
 it is while Ghost is still bound to `127.0.0.1` and nobody else can reach it.
 
-## Installing it into your editors
+## Install into Claude Code
+
+**As a plugin** — one command, nothing else to install:
+
+```
+/plugin marketplace add ThemeAnax/ghostkit
+/plugin install ghostkit@ghostkit
+```
+
+Then restart Claude Code. The plugin ships a self-contained bundled server, so
+there is no npm install, no `node_modules`, and no registry access needed.
+
+Manage it with `/plugin` — it lists what's installed and lets you update or remove.
+
+**Or as a plain MCP server**, if you'd rather not use a plugin:
+
+```bash
+npx -y @indianic/ghostkit install --editors claude
+```
+
+That writes the entry into `~/.claude.json` pinned to `@latest`. This route needs
+access to the npm registry the package is published to.
+
+## Installing it into your other editors
 
 ghostkit registers itself. Ask your agent to run `detect_editors`, pick the ones you want,
 and it calls `register_editors`:

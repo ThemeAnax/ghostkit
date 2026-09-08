@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-marketplace.json",
+  "name": "ghostkit",
+  "owner": {
+    "name": "IndiaNIC Infotech",
+    "url": "https://github.com/ThemeAnax"
+  },
+  "metadata": {
+    "description": "Ghost provisioning for Claude Code",
+    "version": "0.5.0"
+  },
+  "plugins": [
+    {
+      "name": "ghostkit",
+      "source": "./",
+      "description": "Install Ghost on any SSH-reachable ISPConfig host: database, loopback port, systemd --user unit, vhost directives, and the owner account claimed before the site is ever public. Also uploads and activates a theme, generates favicon/wordmark/navigation branding, wires SendGrid, and mints the Admin API key that themeseed needs."
+    }
+  ]
+}
