@@ -5,8 +5,9 @@
 **Get a real Ghost site running on your server. Then get out of the way.**
 
 Installs the latest Ghost on any SSH-reachable ISPConfig host — database, loopback port,
-`systemd --user` unit, vhost directives — and stops there. You create the admin account,
-pick the theme, and wire up email yourself, in Ghost, where those choices belong.
+`systemd --user` unit, vhost directives — and claims the owner account before the site is
+ever public. You pick the theme and wire up email yourself, in Ghost, where those choices
+belong.
 
 Ships as an **MCP server** and a **CLI**.
 
@@ -18,15 +19,18 @@ Ships as an **MCP server** and a **CLI**.
 
 | ghostkit does | you do, in Ghost |
 |---|---|
-| Create the database and user | Create the owner account at `/ghost/` |
-| Allocate a free loopback port | Upload your theme |
-| Install the **latest** Ghost | Configure SendGrid |
-| Run it under `systemd --user`, no sudo for the tenant | Create the Admin API key |
+| Create the database and user | Upload your theme |
+| Allocate a free loopback port | Configure SendGrid |
+| Install the **latest** Ghost | Create the Admin API key |
+| **Claim the owner account, over loopback** | |
+| Run it under `systemd --user`, no sudo for the tenant | |
 | Emit the vhost directives | |
 
-Earlier versions of this tool created the owner, uploaded a theme and configured mail.
-All three were one-time choices that belong to whoever owns the publication, and each one
-added a way for the install to fail. Now it installs Ghost and hands you a link.
+Claiming the owner is automated because it is not really a choice — it is a race. Ghost's
+setup endpoint is unauthenticated and fires exactly once, so the safe moment to call it is
+while Ghost is still bound to `127.0.0.1` and nobody else can reach it. Themes and mail
+stay manual: those are genuine one-time decisions, and each one was a way for the install
+to fail.
 
 ## Quick start
 
@@ -59,11 +63,19 @@ The whole file, when you use sshcon:
 
 ```json
 {
-  "site":   { "domain": "blog.example.com", "port": null },
+  "site":   { "domain": "blog.example.com", "title": "My Blog", "port": null },
+  "admin":  { "name": "Jane Doe", "email": "jane@example.com", "password": "" },
   "server": { "sshcon_alias": "blog-example" },
   "database": { "name": "", "user": "", "password": "" }
 }
 ```
+
+Leave `admin.password` blank and ghostkit generates a 20-character one, writes it back to
+this file, and returns it in the tool result. Give it one instead if you'd rather; Ghost
+requires at least 10 characters. `site.title` falls back to the domain.
+
+The file holds the database password and the admin password, so it is written `0600` — and
+a config left `0644` by an older version is corrected on the next write.
 
 `resolve_server` runs `sshcon list <alias> all` and fills in the rest — the root exec
 alias, host, SSH port, the database the panel provisioned, and the allocated application
@@ -81,23 +93,37 @@ decision you made, never one ghostkit guessed for you.
 | `resolve_server` | Fill server + database from an sshcon alias |
 | `config_status` | Report remaining blank fields |
 | `preflight` | Host readiness matrix + fix commands |
-| `install_ghost` | Install the latest Ghost into the domain's web folder |
+| `install_ghost` | Install the latest Ghost, then claim the owner over loopback |
+| `create_admin` | Claim the owner on its own — retry, or an older install |
 | `publish_site` | Return the vhost directives; you apply them |
 | `status` | Is it up, and **has anyone claimed it yet?** |
 | `next_steps` | The hand-off instructions |
 
-## The one thing to be careful about
+## Why the order matters
 
-`POST /ghost/api/admin/authentication/setup/` is **unauthenticated and one-shot**.
-Whoever opens `/ghost/` first owns the site.
+`POST /ghost/api/admin/authentication/setup/` is **unauthenticated and works exactly
+once**. Whoever calls it first owns the publication — no login required, no way to undo it.
 
-ghostkit installs Ghost bound to `127.0.0.1` only. Nothing is reachable until you apply
-the directives from `publish_site`. From that moment the site is claimable by anyone who
-finds the URL, so **claim it immediately** and confirm with `status`:
+That makes the obvious install order dangerous: point DNS and a reverse proxy at a fresh
+Ghost, then set up the owner, and there is a window — minutes, or days — in which any
+stranger who finds the URL can claim your client's blog.
+
+ghostkit closes it by construction:
+
+| Step | Reachable from | Why |
+|---|---|---|
+| `install_ghost` | `127.0.0.1` only | nothing public exists yet |
+| ↳ owner claimed | `127.0.0.1` only | claimed where nobody else can reach it |
+| `publish_site` | the internet | the site is already owned |
+
+`status` will tell you the truth at any point:
 
 ```
-claimed   NO — anyone can claim this site
+owner_claimed   true
 ```
+
+If it ever says `false` on a published site, run `create_admin` immediately — though at
+that point you are in a race you may already have lost.
 
 ## Requirements
 

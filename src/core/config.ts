@@ -8,9 +8,24 @@ export const CONFIG_FILENAME = "ghostkit.config.json";
 export const ConfigSchema = z.object({
   site: z.object({
     domain: z.string(),
+    /** Ghost's publication title. Blank falls back to the domain. */
+    title: z.string().default(""),
     /** Loopback port. resolve_server fills this from sshcon's Application Port. */
     port: z.number().int().nullable().default(null),
   }),
+  /**
+   * The owner account, claimed over loopback the moment the install finishes.
+   * Ghost's setup endpoint is unauthenticated and works exactly once, so
+   * claiming it before the site is public is what makes the site safe to expose.
+   */
+  admin: z
+    .object({
+      name: z.string().default(""),
+      email: z.string().default(""),
+      /** Blank means ghostkit generates one and writes it back here. */
+      password: z.string().default(""),
+    })
+    .default({ name: "", email: "", password: "" }),
   server: z.object({
     /** The domain's own sshcon alias, e.g. "bastian-ghost". The only field an
      *  sshcon user fills in; resolve_server derives the rest from it. */
@@ -40,15 +55,16 @@ export type Config = z.infer<typeof ConfigSchema>;
  */
 const BLANK = {
   _readme: [
-    "Set site.domain, then supply the server one of two ways:",
+    "Set site.domain and admin.name / admin.email, then supply the server one of two ways:",
     "(a) sshcon: set server.sshcon_alias to the domain's alias and run resolve_server —",
     "    it fills the host, the root exec alias, the database and the port for you.",
     "(b) no sshcon: fill server.host, server.user, server.ssh_key_path and the whole",
     "    database block by hand — nothing can discover them for you.",
-    "Then run preflight, install_ghost, publish_site. ghostkit installs Ghost and stops:",
-    "you create the owner account yourself at https://<domain>/ghost/.",
+    "Leave admin.password blank and ghostkit generates one, writes it back here, and",
+    "returns it. Then run preflight, install_ghost, publish_site.",
   ],
-  site: { domain: "", port: null },
+  site: { domain: "", title: "", port: null },
+  admin: { name: "", email: "", password: "" },
   server: { sshcon_alias: "" },
   database: { name: "", user: "", password: "" },
 };
@@ -102,6 +118,14 @@ export function missingFields(raw: unknown): string[] {
     if (v === undefined || v === null || v === "") missing.push(path);
   };
   need("site.domain", c?.site?.domain);
+  // The owner is claimed automatically, so these are needed before install —
+  // not afterwards. A name and an email cannot be invented; a password can.
+  need("admin.name", c?.admin?.name);
+  need("admin.email", c?.admin?.email);
+  const pw = c?.admin?.password;
+  if (typeof pw === "string" && pw.length > 0 && pw.length < 10) {
+    missing.push("admin.password (Ghost requires at least 10 characters; leave blank to generate one)");
+  }
 
   // Either sshcon can be asked for the connection details, or all of them —
   // including the panel's database — are supplied by hand.

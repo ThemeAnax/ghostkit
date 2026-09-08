@@ -6,14 +6,23 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
 
+import type { Config } from "../core/config.js";
 import { initConfig, loadConfig, missingFields, configPath, writeConfigFile } from "../core/config.js";
 import { Ssh, shellQuote } from "../core/ssh.js";
-import { preflight, setupStatus, installedVersion, waitForGhost } from "../core/ghost.js";
+import {
+  preflight,
+  setupStatus,
+  setupOwner,
+  generatePassword,
+  installedVersion,
+  waitForGhost,
+} from "../core/ghost.js";
+import type { SiteLayout } from "../core/site.js";
 import { resolveSite, apacheDirectives, serviceState } from "../core/site.js";
 import { readSshconServer } from "../core/sshcon.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
-const VERSION = "0.2.1";
+const VERSION = "0.3.0";
 
 const server = new McpServer({ name: "ghostkit", version: VERSION });
 
@@ -25,11 +34,57 @@ function sshFor(dir?: string) {
   return { cfg, ssh: new Ssh(cfg.server) };
 }
 
+/**
+ * Claim the owner account, generating a password when the config leaves one
+ * blank. A generated password is written back to the config first: it is the
+ * only record of it, and a secret that exists solely in a tool result is gone
+ * the moment the conversation scrolls away.
+ */
+async function claimOwner(
+  dir: string | undefined,
+  ssh: Ssh,
+  cfg: Config,
+  site: SiteLayout,
+): Promise<{ alreadySetUp: boolean; password: string; generated: boolean; blogTitle: string }> {
+  // Check first. Generating before knowing would write a password into the
+  // config for a site claimed by some other account — a stored secret that
+  // looks authoritative and opens nothing.
+  if (await setupStatus(ssh, site.port, cfg.site.domain)) {
+    return {
+      alreadySetUp: true,
+      password: cfg.admin.password,
+      generated: false,
+      blogTitle: cfg.site.title?.trim() || cfg.site.domain,
+    };
+  }
+
+  let password = cfg.admin.password;
+  let generated = false;
+
+  if (!password) {
+    password = generatePassword();
+    generated = true;
+    const path = configPath(dir);
+    const raw = JSON.parse(readFileSync(path, "utf8")) as Record<string, Record<string, unknown>>;
+    raw.admin = { ...(raw.admin ?? {}), password };
+    writeConfigFile(path, raw);
+  }
+
+  const r = await setupOwner(ssh, site.port, cfg.site.domain, {
+    name: cfg.admin.name,
+    email: cfg.admin.email,
+    password,
+    blogTitle: cfg.site.title,
+  });
+  return { alreadySetUp: r.alreadySetUp, password, generated, blogTitle: r.blogTitle };
+}
+
 /** What the user does after ghostkit steps back. Kept in one place. */
 function nextSteps(domain: string, ghostDir: string, shellUser: string) {
   return {
-    "1_create_your_admin_account": `Open https://${domain}/ghost/ and create the owner account. ` +
-      `This endpoint is unauthenticated and one-shot — the FIRST person to open it owns the site. Do it now.`,
+    "1_sign_in": `Sign in at https://${domain}/ghost/ with admin.email and admin.password from your ` +
+      `ghostkit.config.json. ghostkit already claimed the owner account over loopback, before the site was ` +
+      `public, so nobody else could take it. Change the password once you are in.`,
     "2_install_a_theme": `Ghost admin -> Settings -> Design -> Change theme -> Upload theme, and pick your zip.`,
     "3_set_up_email_sendgrid": [
       `Transactional mail (member logins, staff invites, password resets) needs SMTP.`,
@@ -214,13 +269,78 @@ server.registerTool(
     const site = await resolveSite(ssh, cfg.site.domain);
     const up = await waitForGhost(ssh, site.port, cfg.site.domain);
 
+    // Claim the owner NOW, while Ghost is still bound to 127.0.0.1. The setup
+    // endpoint is unauthenticated and one-shot, so this is the only moment it
+    // can be done with nobody else able to reach it.
+    let owner: Awaited<ReturnType<typeof claimOwner>> | undefined;
+    let ownerError: string | undefined;
+    if (up) {
+      try {
+        owner = await claimOwner(dir, ssh, cfg, site);
+      } catch (e) {
+        ownerError = (e as Error).message;
+      }
+    } else {
+      ownerError = "Ghost did not answer on its loopback port, so the owner could not be claimed.";
+    }
+
     return json({
       ok: true,
       ghost_version: await installedVersion(ssh, site),
       responding_on_loopback: up,
       site,
-      next: "Run publish_site to expose it, then claim the owner account immediately.",
+      owner: owner
+        ? {
+            claimed: true,
+            already_existed: owner.alreadySetUp,
+            name: cfg.admin.name,
+            email: cfg.admin.email,
+            password: owner.password,
+            password_generated: owner.generated,
+            blog_title: owner.blogTitle,
+            admin_url: `https://${cfg.site.domain}/ghost/`,
+            note: owner.generated
+              ? "Generated and saved to admin.password in your ghostkit.config.json (mode 0600). Save it somewhere you trust."
+              : "Taken from admin.password in your config.",
+          }
+        : { claimed: false, error: ownerError, retry_with: "create_admin" },
+      next: owner
+        ? "Run publish_site. The site is already claimed, so exposing it is safe."
+        : "Fix the error above and run create_admin BEFORE publish_site — an unclaimed public site can be taken by anyone.",
       log: out.slice(-3000),
+    });
+  },
+);
+
+server.registerTool(
+  "create_admin",
+  {
+    title: "Claim the owner account",
+    description:
+      "Create the Ghost owner through the setup endpoint, over loopback. install_ghost already does this — use " +
+      "this tool to retry when that failed, or after an install that predates it. Uses admin.name / admin.email " +
+      "from the config, and admin.password if set, otherwise generates one and writes it back. Idempotent: a " +
+      "site that is already claimed is reported, never overwritten.",
+    inputSchema: { dir: z.string().optional() },
+  },
+  async ({ dir }) => {
+    const { cfg, ssh } = sshFor(dir);
+    const site = await resolveSite(ssh, cfg.site.domain);
+    const owner = await claimOwner(dir, ssh, cfg, site);
+    return json({
+      ok: true,
+      already_existed: owner.alreadySetUp,
+      name: cfg.admin.name,
+      email: cfg.admin.email,
+      // On an already-claimed site this is whatever the config holds, which is
+      // not necessarily the password that actually claimed it.
+      password: owner.alreadySetUp ? undefined : owner.password,
+      password_generated: owner.alreadySetUp ? undefined : owner.generated,
+      blog_title: owner.blogTitle,
+      admin_url: `https://${cfg.site.domain}/ghost/`,
+      note: owner.alreadySetUp
+        ? "This site was already claimed. Ghost's setup endpoint works once, so no password was set here — sign in with the account that claimed it, or reset it from Ghost."
+        : undefined,
     });
   },
 );
@@ -245,9 +365,9 @@ server.registerTool(
       owner_claimed: claimed,
       warning: claimed
         ? undefined
-        : `UNCLAIMED. Once this is public, https://${cfg.site.domain}/ghost/ will let ANYONE create the owner ` +
-          `account — Ghost's setup endpoint is unauthenticated and one-shot. Open it and claim the site the ` +
-          `moment the directives are applied, then run status to confirm.`,
+        : `UNCLAIMED — do not publish yet. Ghost's setup endpoint is unauthenticated and one-shot, so once ` +
+          `this is public ANYONE who opens https://${cfg.site.domain}/ghost/ becomes the owner. Run ` +
+          `create_admin first; it claims the site over loopback where nobody else can reach it.`,
       how_to_apply: [
         "sshmanager_update_domain({server_id, apache_directives}) — writes these verbatim. PREFERRED.",
         "paste into ISPConfig -> Sites -> Options -> Apache Directives",

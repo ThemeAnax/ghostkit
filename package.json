@@ -1,7 +1,7 @@
 {
   "name": "@indianic/ghostkit",
-  "version": "0.2.1",
-  "description": "Install Ghost on any SSH-reachable ISPConfig host. No owner, no theme, no mail \u2014 you do those in Ghost.",
+  "version": "0.3.0",
+  "description": "Install Ghost on any SSH-reachable ISPConfig host and claim the owner before it goes public.",
   "type": "module",
   "main": "./dist/index.js",
   "bin": {

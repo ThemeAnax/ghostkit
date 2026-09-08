@@ -1,3 +1,4 @@
+import { randomBytes } from "node:crypto";
 import { Ssh, shellQuote } from "./ssh.js";
 import type { SiteLayout } from "./site.js";
 
@@ -127,6 +128,68 @@ export async function setupStatus(ssh: Ssh, port: number, domain: string): Promi
   } catch {
     return false;
   }
+}
+
+/**
+ * A password Ghost will accept and a human can still retype. Excludes the
+ * characters that get misread out loud or mangled in a shell — 0/O, 1/l/I,
+ * and quotes — and takes randomness from crypto, never Math.random.
+ */
+export function generatePassword(length = 20): string {
+  const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789";
+  if (length < 10) throw new Error("Ghost requires a password of at least 10 characters");
+  const bytes = randomBytes(length * 2);
+  let out = "";
+  for (let i = 0; out.length < length && i < bytes.length; i++) {
+    // Reject above the largest whole multiple of the alphabet, so every
+    // character stays equally likely rather than slightly favouring the front.
+    const max = 256 - (256 % alphabet.length);
+    if (bytes[i] < max) out += alphabet[bytes[i] % alphabet.length];
+  }
+  return out.length === length ? out : out + generatePassword(length - out.length);
+}
+
+export interface SetupResult {
+  alreadySetUp: boolean;
+  name: string;
+  email: string;
+  blogTitle: string;
+}
+
+/**
+ * Claim the owner account through Ghost's setup endpoint, over loopback,
+ * BEFORE the site is public.
+ *
+ * That endpoint is unauthenticated and works exactly once: whoever calls it
+ * first owns the publication. Doing it here — while Ghost is still bound to
+ * 127.0.0.1 — is what makes the site safe to expose afterwards. Idempotent:
+ * a site that is already claimed is reported, not overwritten.
+ */
+export async function setupOwner(
+  ssh: Ssh,
+  port: number,
+  domain: string,
+  owner: { name: string; email: string; password: string; blogTitle?: string },
+): Promise<SetupResult> {
+  const blogTitle = owner.blogTitle?.trim() || domain;
+
+  if (await setupStatus(ssh, port, domain)) {
+    return { alreadySetUp: true, name: owner.name, email: owner.email, blogTitle };
+  }
+  if (owner.password.length < 10) {
+    throw new Error("Ghost requires a password of at least 10 characters");
+  }
+
+  const r = await ssh.curlLoopback(port, domain, "/ghost/api/admin/authentication/setup/", {
+    method: "POST",
+    json: {
+      setup: [{ name: owner.name, email: owner.email, password: owner.password, blogTitle }],
+    },
+  });
+  if (r.status < 200 || r.status >= 300) {
+    throw new Error(`owner setup failed (${r.status}): ${r.body.slice(0, 400)}`);
+  }
+  return { alreadySetUp: false, name: owner.name, email: owner.email, blogTitle };
 }
 
 /**
