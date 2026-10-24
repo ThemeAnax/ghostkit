@@ -175,7 +175,11 @@ server.registerTool(
       path: r.path,
       created: r.created,
       still_required: r.needsFilling,
-      note: "With sshcon: set server.sshcon_alias, then run resolve_server. Without it, fill server.host, server.user, server.ssh_key_path and the database block by hand.",
+      note:
+        "With sshcon: set server.sshcon_alias (the SITE's alias) and server.exec_alias (the HOST's root " +
+        'alias, e.g. "server4"), then run resolve_server. These are two different things and exec_alias ' +
+        "cannot be derived from the other — ask which host the site belongs on rather than guessing. " +
+        "Without sshcon, fill server.host, server.user, server.ssh_key_path and the database block by hand.",
     });
   },
 );
@@ -217,10 +221,15 @@ server.registerTool(
     // server.user is deliberately untouched: it is the account provisioning
     // runs as, which must be root. s.username is the unprivileged tenant, and
     // the shell user is read back from ISPConfig anyway.
+    // Keep an exec_alias the caller already set: they know which host they meant,
+    // and sshcon's "Server Name" is only a hint. Never fall back to useAlias —
+    // that is the domain's own tenant login, so writing it here would look like
+    // a resolved host while being an account that cannot provision anything.
+    const existingExec = (raw.server?.exec_alias as string) || "";
     raw.server = {
       ...(raw.server ?? {}),
       sshcon_alias: useAlias,
-      exec_alias: s.serverName || useAlias,
+      exec_alias: existingExec || s.serverName || "",
       host: s.host,
       port: s.port,
     };
@@ -239,8 +248,12 @@ server.registerTool(
       ok: true,
       path,
       derived: {
-        exec_alias: raw.server.exec_alias,
-        exec_alias_note: `provisioning runs through '${raw.server.exec_alias}' — the root login for this host`,
+        exec_alias: raw.server.exec_alias || null,
+        exec_alias_note: raw.server.exec_alias
+          ? `provisioning runs through '${raw.server.exec_alias}' — the root login for this host`
+          : `sshcon has no "Server Name" for '${useAlias}', so the host is unknown. Set server.exec_alias ` +
+            `to the host's root alias (e.g. "server4") — ASK which host rather than guessing, since the ` +
+            `wrong one provisions a site on somebody else's server.`,
         host: s.host,
         ssh_port: s.port,
         tenant_user: s.username,

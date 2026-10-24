@@ -1,6 +1,6 @@
 {
   "name": "@indianic/ghostkit",
-  "version": "0.6.1",
+  "version": "0.7.0",
   "publishConfig": {
     "registry": "https://npm.indianic.in/"
   },

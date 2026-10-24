@@ -29,7 +29,20 @@ export class Ssh {
   private argv(command: string): [string, string[]] {
     // exec_alias wins: provisioning needs root, and the domain's own alias is
     // an unprivileged tenant login on the same box.
-    const alias = this.server.exec_alias || this.server.sshcon_alias;
+    //
+    // Falling back to sshcon_alias silently is worse than refusing. The tenant
+    // login cannot do any of this, so the fallback buys nothing and costs a
+    // confusing failure — "Permission denied (publickey)" from a shell user
+    // that may not even have an authorized_keys yet, mid-provision, with no
+    // hint that the wrong alias was used.
+    if (!this.server.exec_alias && this.server.sshcon_alias && !this.server.host) {
+      throw new Error(
+        `server.exec_alias is not set. '${this.server.sshcon_alias}' is this domain's own tenant login, ` +
+          `which cannot provision anything — set exec_alias to the HOST's root alias (e.g. "server4"). ` +
+          `Run resolve_server to read it from sshcon, or pass it in the config.`,
+      );
+    }
+    const alias = this.server.exec_alias;
     if (alias) {
       return ["sshcon", ["exec", alias, "--no-cd", "--", command]];
     }

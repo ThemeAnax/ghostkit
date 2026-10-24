@@ -191,6 +191,20 @@ export function missingFields(raw: unknown): string[] {
       need("database.password", c?.database?.password);
     }
   }
+
+  // Which HOST are we building on? Provisioning needs root, and the domain's
+  // own alias is an unprivileged tenant login on the same box — so this cannot
+  // be inferred from sshcon_alias.
+  //
+  // It is required rather than guessed because guessing it wrong puts a site on
+  // the wrong server, and a wrong site on a shared host is not a quiet mistake:
+  // it gets a vhost next to every other tenant's. Ask for it.
+  //
+  // resolve_server fills it in from sshcon's "Server Name" when the domain
+  // alias already exists; before that, only the person running this knows.
+  if (c?.server?.sshcon_alias && !c?.server?.host) {
+    need("server.exec_alias (the HOST's root alias, e.g. \"server4\" — not the site's own alias)", c?.server?.exec_alias);
+  }
   return missing;
 }
 

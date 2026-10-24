@@ -31153,6 +31153,9 @@ function missingFields(raw) {
       need("database.password", c?.database?.password);
     }
   }
+  if (c?.server?.sshcon_alias && !c?.server?.host) {
+    need(`server.exec_alias (the HOST's root alias, e.g. "server4" \u2014 not the site's own alias)`, c?.server?.exec_alias);
+  }
   return missing;
 }
 function loadConfig(dir = process.cwd()) {
@@ -31182,7 +31185,12 @@ var Ssh = class {
   }
   server;
   argv(command) {
-    const alias = this.server.exec_alias || this.server.sshcon_alias;
+    if (!this.server.exec_alias && this.server.sshcon_alias && !this.server.host) {
+      throw new Error(
+        `server.exec_alias is not set. '${this.server.sshcon_alias}' is this domain's own tenant login, which cannot provision anything \u2014 set exec_alias to the HOST's root alias (e.g. "server4"). Run resolve_server to read it from sshcon, or pass it in the config.`
+      );
+    }
+    const alias = this.server.exec_alias;
     if (alias) {
       return ["sshcon", ["exec", alias, "--no-cd", "--", command]];
     }
@@ -32132,7 +32140,7 @@ server.registerTool(
       path: r.path,
       created: r.created,
       still_required: r.needsFilling,
-      note: "With sshcon: set server.sshcon_alias, then run resolve_server. Without it, fill server.host, server.user, server.ssh_key_path and the database block by hand."
+      note: `With sshcon: set server.sshcon_alias (the SITE's alias) and server.exec_alias (the HOST's root alias, e.g. "server4"), then run resolve_server. These are two different things and exec_alias cannot be derived from the other \u2014 ask which host the site belongs on rather than guessing. Without sshcon, fill server.host, server.user, server.ssh_key_path and the database block by hand.`
     });
   }
 );
@@ -32163,10 +32171,11 @@ server.registerTool(
       });
     }
     const s = await readSshconServer(useAlias);
+    const existingExec = raw.server?.exec_alias || "";
     raw.server = {
       ...raw.server ?? {},
       sshcon_alias: useAlias,
-      exec_alias: s.serverName || useAlias,
+      exec_alias: existingExec || s.serverName || "",
       host: s.host,
       port: s.port
     };
@@ -32182,8 +32191,8 @@ server.registerTool(
       ok: true,
       path,
       derived: {
-        exec_alias: raw.server.exec_alias,
-        exec_alias_note: `provisioning runs through '${raw.server.exec_alias}' \u2014 the root login for this host`,
+        exec_alias: raw.server.exec_alias || null,
+        exec_alias_note: raw.server.exec_alias ? `provisioning runs through '${raw.server.exec_alias}' \u2014 the root login for this host` : `sshcon has no "Server Name" for '${useAlias}', so the host is unknown. Set server.exec_alias to the host's root alias (e.g. "server4") \u2014 ASK which host rather than guessing, since the wrong one provisions a site on somebody else's server.`,
         host: s.host,
         ssh_port: s.port,
         tenant_user: s.username,
