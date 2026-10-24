@@ -58,8 +58,22 @@ export const ConfigSchema = z.object({
     .object({
       name: z.string().default(""),
       email: z.string().default(""),
+      /** Only for a staff account you intend to create. Ghost never imports a
+       *  password: imported staff must reset theirs before they can sign in. */
+      password: z.string().default(""),
     })
-    .default({ name: "", email: "" }),
+    .default({ name: "", email: "", password: "" }),
+  /** A Ghost export to import once the theme is active, e.g. a theme's demo content. */
+  content: z
+    .object({
+      /** Path to the universal-import zip. Blank imports nothing. */
+      source: z.string().default(""),
+      /** routes.yaml, when the theme needs one. It ships BESIDE the theme zip
+       *  rather than inside it, so install_theme cannot find it and the custom
+       *  routes 404 until it is uploaded. */
+      routes: z.string().default(""),
+    })
+    .default({ source: "", routes: "" }),
   server: z.object({
     /** The domain's own sshcon alias, e.g. "bastian-ghost". The only field an
      *  sshcon user fills in; resolve_server derives the rest from it. */

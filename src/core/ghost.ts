@@ -472,6 +472,86 @@ export async function uploadRoutes(
   return !/"errors"/.test(body);
 }
 
+export interface ImportResult {
+  ok: boolean;
+  problems: unknown[];
+  counts: { posts: number; pages: number; tags: number; users: number };
+}
+
+/**
+ * Import a Ghost export (the universal-import zip: content JSON plus its
+ * uploaded files) and report what landed.
+ *
+ * This goes through an owner session, not the Admin API key. Ghost restricts
+ * importContent to owner/admin USERS and does not grant it to custom
+ * integrations, so the API key every other call here uses would get
+ * "You do not have permission to importContent db" — which reads like a broken
+ * key rather than a deliberate limit.
+ */
+export async function importContent(
+  ssh: Ssh,
+  port: number,
+  domain: string,
+  owner: { email: string; password: string },
+  localFile: string,
+): Promise<ImportResult> {
+  const local = resolvePath(localFile.replace(/^~(?=$|\/)/, homedir()));
+  if (!existsSync(local)) {
+    throw new Error(`import file not found: ${local}`);
+  }
+  const tmpDir = "/tmp/ghostkit-import";
+  const tmp = `${tmpDir}/content.zip`;
+  await ssh.must(`rm -rf ${tmpDir} && mkdir -p ${tmpDir}`);
+  await ssh.upload(local, tmp);
+
+  const cookie = await ownerCookie(ssh, port, domain, owner);
+  const auth = `${adminHeaders(domain)}-H ${shellQuote(`Cookie: ${cookie}`)} `;
+
+  // A large import with images can run for minutes.
+  const r = await ssh.exec(
+    `curl -sS -X POST ${auth}` +
+      `-F ${shellQuote(`importfile=@${tmp};type=application/zip`)} ` +
+      `${shellQuote(`http://127.0.0.1:${port}/ghost/api/admin/db/`)}`,
+    { timeoutMs: 900_000 },
+  );
+  await ssh.exec(`rm -rf ${tmpDir}`);
+
+  let problems: unknown[] = [];
+  try {
+    const parsed = JSON.parse(r.stdout) as { db?: unknown[]; problems?: unknown[]; errors?: unknown[] };
+    if (parsed.errors?.length) {
+      throw new Error(`import failed: ${JSON.stringify(parsed.errors).slice(0, 400)}`);
+    }
+    problems = parsed.problems ?? [];
+  } catch (e) {
+    if (e instanceof Error && e.message.startsWith("import failed")) throw e;
+    throw new Error(`import returned something unreadable: ${r.stdout.slice(0, 400)}`);
+  }
+
+  // Count what actually landed rather than trusting an empty problems array.
+  const count = async (res: string): Promise<number> => {
+    const out = await ssh.exec(
+      `curl -sS ${auth}${shellQuote(`http://127.0.0.1:${port}/ghost/api/admin/${res}/?limit=1&formats=`)}`,
+    );
+    try {
+      return (JSON.parse(out.stdout).meta?.pagination?.total as number) ?? 0;
+    } catch {
+      return 0;
+    }
+  };
+
+  return {
+    ok: true,
+    problems,
+    counts: {
+      posts: await count("posts"),
+      pages: await count("pages"),
+      tags: await count("tags"),
+      users: await count("users"),
+    },
+  };
+}
+
 /**
  * Point Ghost's transactional mail at SendGrid using ghost-cli, which writes
  * the nested config keys itself — no JSON editing, and it survives upgrades.

@@ -31002,6 +31002,7 @@ var StdioServerTransport = class {
 
 // src/mcp/index.ts
 import { existsSync as existsSync4, readFileSync as readFileSync3 } from "node:fs";
+import { homedir as homedir4 } from "node:os";
 import { dirname as dirname2, resolve as resolve2 } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -31051,8 +31052,20 @@ var ConfigSchema = external_exports.object({
   /** Byline for generated content. Optional; themeseed asks per blog without it. */
   author: external_exports.object({
     name: external_exports.string().default(""),
-    email: external_exports.string().default("")
-  }).default({ name: "", email: "" }),
+    email: external_exports.string().default(""),
+    /** Only for a staff account you intend to create. Ghost never imports a
+     *  password: imported staff must reset theirs before they can sign in. */
+    password: external_exports.string().default("")
+  }).default({ name: "", email: "", password: "" }),
+  /** A Ghost export to import once the theme is active, e.g. a theme's demo content. */
+  content: external_exports.object({
+    /** Path to the universal-import zip. Blank imports nothing. */
+    source: external_exports.string().default(""),
+    /** routes.yaml, when the theme needs one. It ships BESIDE the theme zip
+     *  rather than inside it, so install_theme cannot find it and the custom
+     *  routes 404 until it is uploaded. */
+    routes: external_exports.string().default("")
+  }).default({ source: "", routes: "" }),
   server: external_exports.object({
     /** The domain's own sshcon alias, e.g. "bastian-ghost". The only field an
      *  sshcon user fills in; resolve_server derives the rest from it. */
@@ -31522,6 +31535,54 @@ async function uploadRoutes(ssh, port, domain2, adminApiKey, remoteFile) {
   );
   return !/"errors"/.test(body);
 }
+async function importContent(ssh, port, domain2, owner, localFile) {
+  const local = resolvePath(localFile.replace(/^~(?=$|\/)/, homedir2()));
+  if (!existsSync2(local)) {
+    throw new Error(`import file not found: ${local}`);
+  }
+  const tmpDir = "/tmp/ghostkit-import";
+  const tmp = `${tmpDir}/content.zip`;
+  await ssh.must(`rm -rf ${tmpDir} && mkdir -p ${tmpDir}`);
+  await ssh.upload(local, tmp);
+  const cookie = await ownerCookie(ssh, port, domain2, owner);
+  const auth = `${adminHeaders(domain2)}-H ${shellQuote(`Cookie: ${cookie}`)} `;
+  const r = await ssh.exec(
+    `curl -sS -X POST ${auth}-F ${shellQuote(`importfile=@${tmp};type=application/zip`)} ${shellQuote(`http://127.0.0.1:${port}/ghost/api/admin/db/`)}`,
+    { timeoutMs: 9e5 }
+  );
+  await ssh.exec(`rm -rf ${tmpDir}`);
+  let problems = [];
+  try {
+    const parsed = JSON.parse(r.stdout);
+    if (parsed.errors?.length) {
+      throw new Error(`import failed: ${JSON.stringify(parsed.errors).slice(0, 400)}`);
+    }
+    problems = parsed.problems ?? [];
+  } catch (e) {
+    if (e instanceof Error && e.message.startsWith("import failed")) throw e;
+    throw new Error(`import returned something unreadable: ${r.stdout.slice(0, 400)}`);
+  }
+  const count = async (res) => {
+    const out = await ssh.exec(
+      `curl -sS ${auth}${shellQuote(`http://127.0.0.1:${port}/ghost/api/admin/${res}/?limit=1&formats=`)}`
+    );
+    try {
+      return JSON.parse(out.stdout).meta?.pagination?.total ?? 0;
+    } catch {
+      return 0;
+    }
+  };
+  return {
+    ok: true,
+    problems,
+    counts: {
+      posts: await count("posts"),
+      pages: await count("pages"),
+      tags: await count("tags"),
+      users: await count("users")
+    }
+  };
+}
 async function configureMail(ssh, site, opts) {
   const cfg = [
     "mail.transport SMTP",
@@ -31598,6 +31659,72 @@ function apacheDirectives(port) {
     "    Require all denied",
     "</FilesMatch>"
   ].join("\n");
+}
+async function applyVhost(ssh, domain2, directives, opts = {}) {
+  const q = shellQuote(domain2);
+  const found = await ssh.exec(
+    `ls /etc/apache2/sites-available/${q}.vhost /etc/apache2/sites-available/*${q}*.vhost 2>/dev/null | sort -u`
+  );
+  const files = found.stdout.trim().split("\n").filter(Boolean);
+  if (files.length === 0) {
+    throw new Error(
+      `No Apache vhost found for '${domain2}'. Create the website in ISPConfig first, then run this again.`
+    );
+  }
+  const marker = "# >>> ghostkit managed >>>";
+  const endMarker = "# <<< ghostkit managed <<<";
+  const block = `${marker}
+${directives}
+${endMarker}`;
+  const b64 = Buffer.from(block).toString("base64");
+  const backups = [];
+  let wrote = false;
+  let rebound = false;
+  for (const file2 of files) {
+    const f = shellQuote(file2);
+    const stamp = `${file2}.ghostkit.${Date.now()}`;
+    await ssh.must(`cp -a ${f} ${shellQuote(stamp)}`);
+    backups.push(stamp);
+    const bound = await ssh.exec(`grep -cE '^[[:space:]]*<VirtualHost[[:space:]]+[0-9]' ${f} || true`);
+    if (Number(bound.stdout.trim()) > 0) {
+      await ssh.must(
+        `sed -i -E 's|^([[:space:]]*)<VirtualHost[[:space:]]+[0-9][0-9.]*:|\\1<VirtualHost *:|' ${f}`
+      );
+      rebound = true;
+    }
+    const already = await ssh.exec(`grep -qF ${shellQuote(marker)} ${f} && echo yes || echo no`);
+    if (already.stdout.trim() === "yes") {
+      await ssh.must(
+        `perl -0pi -e 's/\\Q${marker}\\E.*?\\Q${endMarker}\\E\\n?//gs' ${f}`
+      );
+    }
+    await ssh.must(
+      `echo ${shellQuote(b64)} | base64 -d > /tmp/ghostkit-vhost.$$ && awk -v blockfile=/tmp/ghostkit-vhost.$$ '/^[[:space:]]*<\\/VirtualHost>/ { while ((getline line < blockfile) > 0) print line; close(blockfile) } { print }' ${f} > ${f}.ghostkit.new && mv ${f}.ghostkit.new ${f} && rm -f /tmp/ghostkit-vhost.$$`
+    );
+    wrote = true;
+  }
+  const test = await ssh.exec("apache2ctl configtest 2>&1 || httpd -t 2>&1");
+  if (!/Syntax OK/.test(test.stdout)) {
+    for (let i = 0; i < files.length; i++) {
+      await ssh.exec(`cp -a ${shellQuote(backups[i])} ${shellQuote(files[i])}`);
+    }
+    throw new Error(
+      `Apache rejected the config, so nothing was changed \u2014 the vhost files were restored from backup.
+${test.stdout.slice(0, 600)}`
+    );
+  }
+  let reloaded = false;
+  if (opts.reload !== false) {
+    await ssh.must("systemctl reload apache2 2>/dev/null || systemctl reload httpd");
+    reloaded = true;
+  }
+  return { files, backups, alreadyPresent: !wrote, reloaded, rebound };
+}
+async function ipBoundVhosts(ssh) {
+  const r = await ssh.exec(
+    `apache2ctl -S 2>/dev/null | awk '/^[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+:[0-9]+/ {print $NF}' | sort -u || true`
+  );
+  return r.stdout.trim().split("\n").filter(Boolean);
 }
 async function restartGhost(ssh, site) {
   const uid = (await ssh.exec(`id -u ${shellQuote(site.sysUser)}`)).stdout.trim();
@@ -32274,6 +32401,64 @@ server.registerTool(
   }
 );
 server.registerTool(
+  "import_content",
+  {
+    title: "Import a Ghost export (demo content) into the site",
+    description: "Import the universal-import zip at content.source \u2014 posts, pages, tags, staff and their uploaded files \u2014 and report what landed. Runs through an OWNER session: Ghost restricts importContent to owner/admin users and does not grant it to custom integrations, so the Admin API key every other tool here uses is refused with 'You do not have permission to importContent db'. Install and activate the theme FIRST \u2014 a theme's demo content carries settings keyed to the theme's name, and those are dropped if that theme is not active. Also uploads content.routes when set.",
+    inputSchema: {
+      dir: external_exports.string().optional(),
+      source: external_exports.string().optional().describe("Overrides content.source. Path to the export zip on THIS machine."),
+      routes: external_exports.string().optional().describe("Overrides content.routes. Path to routes.yaml on THIS machine.")
+    }
+  },
+  async ({ dir, source, routes }) => {
+    const { cfg, ssh } = sshFor(dir);
+    const src = source || cfg.content.source;
+    const routesSrc = routes || cfg.content.routes;
+    if (!src && !routesSrc) {
+      return json2({ ok: true, skipped: "Neither content.source nor content.routes is set." });
+    }
+    if (!cfg.admin.email || !cfg.admin.password) {
+      return json2({
+        ok: false,
+        error: "admin.email and admin.password are required \u2014 the import runs as the owner, not as an API key. Run create_admin first."
+      });
+    }
+    const site = await resolveSite(ssh, cfg.site.domain);
+    let imported;
+    if (src) {
+      imported = await importContent(ssh, site.port, cfg.site.domain, cfg.admin, src);
+    }
+    let routesResult;
+    if (routesSrc) {
+      if (!cfg.admin.api_key) {
+        routesResult = "skipped: admin.api_key is empty \u2014 run create_admin_key first";
+      } else {
+        const tmp = "/tmp/ghostkit-routes.yaml";
+        try {
+          await ssh.upload(routesSrc.replace(/^~(?=$|\/)/, homedir4()), tmp);
+          const ok = await uploadRoutes(ssh, site.port, cfg.site.domain, cfg.admin.api_key, tmp);
+          await ssh.exec(`rm -f ${tmp}`);
+          routesResult = ok ? "uploaded" : "rejected by Ghost";
+        } catch (e) {
+          routesResult = `failed: ${e.message}`;
+        }
+      }
+    }
+    return json2({
+      ok: true,
+      imported: imported ? {
+        counts: imported.counts,
+        problems: imported.problems.length ? imported.problems : void 0,
+        note: imported.problems.length ? "Ghost reported problems; the import still applied what it could." : void 0
+      } : void 0,
+      routes_yaml: routesResult,
+      staff_note: "Ghost never imports passwords. Any staff user that came in with this export must reset theirs before they can sign in.",
+      next: routesResult === "uploaded" ? "Ghost restarts after a routes change \u2014 give it ~15s." : void 0
+    });
+  }
+);
+server.registerTool(
   "apply_branding",
   {
     title: "Generate and apply icon, logo, accent colour and navigation",
@@ -32364,24 +32549,47 @@ server.registerTool(
 server.registerTool(
   "publish_site",
   {
-    title: "Get the vhost directives that make the site public",
-    description: "Return the Apache directive block and port. This server does NOT write it \u2014 apply it with sshmanager_update_domain({server_id, apache_directives}), or paste it into ISPConfig. Run this LAST: it is the step that exposes the site.",
-    inputSchema: { dir: external_exports.string().optional() }
+    title: "Make the site public: write the vhost directives and reload Apache",
+    description: "Write the Apache directive block into the domain's vhost, verify the config still parses, and reload. Takes a backup first and restores it if Apache rejects the result, so a bad write cannot take the host down. Also rewrites an IP-bound <VirtualHost> to a wildcard: an IP-literal vhost outranks every wildcard one on the same address, which would make this site answer for EVERY domain on the host. Run this LAST \u2014 it is the step that exposes the site. Pass dry_run to see the block without writing.",
+    inputSchema: {
+      dir: external_exports.string().optional(),
+      dry_run: external_exports.boolean().optional().describe("Return the directives without touching the server."),
+      reload: external_exports.boolean().optional().describe("Reload Apache after writing. Default true; false writes and configtests only.")
+    }
   },
-  async ({ dir }) => {
+  async ({ dir, dry_run, reload }) => {
     const { cfg, ssh } = sshFor(dir);
     const site = await resolveSite(ssh, cfg.site.domain);
     const claimed = await setupStatus(ssh, site.port, cfg.site.domain);
+    const directives = apacheDirectives(site.port);
+    if (!claimed) {
+      return json2({
+        ok: false,
+        error: "owner not claimed",
+        port: site.port,
+        apache_directives: directives,
+        warning: `UNCLAIMED \u2014 refusing to publish. Ghost's setup endpoint is unauthenticated and one-shot, so once this is public ANYONE who opens https://${cfg.site.domain}/ghost/ becomes the owner. Run create_admin first; it claims the site over loopback where nobody else can reach it.`
+      });
+    }
+    if (dry_run) {
+      return json2({ ok: true, dry_run: true, port: site.port, apache_directives: directives });
+    }
+    const applied = await applyVhost(ssh, cfg.site.domain, directives, { reload });
+    const strays = await ipBoundVhosts(ssh);
     return json2({
+      ok: true,
       port: site.port,
-      apache_directives: apacheDirectives(site.port),
-      owner_claimed: claimed,
-      warning: claimed ? void 0 : `UNCLAIMED \u2014 do not publish yet. Ghost's setup endpoint is unauthenticated and one-shot, so once this is public ANYONE who opens https://${cfg.site.domain}/ghost/ becomes the owner. Run create_admin first; it claims the site over loopback where nobody else can reach it.`,
-      how_to_apply: [
-        "sshmanager_update_domain({server_id, apache_directives}) \u2014 writes these verbatim. PREFERRED.",
-        "paste into ISPConfig -> Sites -> Options -> Apache Directives"
-      ],
-      trap: 'Do NOT use sshmanager_set_domain_port for this. It regenerates its own proxy block and drops RequestHeader set X-Forwarded-Proto "https", after which Ghost answers POST /ghost/api/admin/session/ with 201 and no Set-Cookie \u2014 so nobody can sign in and the admin UI just spins. Same trap applies to sending application_ports to sshmanager_update_domain without apache_directives.'
+      owner_claimed: true,
+      vhost_files: applied.files,
+      backups: applied.backups,
+      reloaded: applied.reloaded,
+      rebound_to_wildcard: applied.rebound || void 0,
+      rebound_note: applied.rebound ? "This vhost was bound to a literal IP and has been rewritten to <VirtualHost *:\u2026>. Left alone it would have outranked every other site on that address and served this site for all of them." : void 0,
+      other_ip_bound_vhosts: strays.length ? strays : void 0,
+      other_ip_bound_note: strays.length ? "These vhosts still bind a literal IP and may be hijacking name-based matching for other domains." : void 0,
+      url: `https://${cfg.site.domain}/`,
+      verify: `curl -s -o /dev/null -w '%{http_code}' https://${cfg.site.domain}/   # expect 200, not 301`,
+      note: "ISPConfig owns this file and may regenerate it. The block is fenced in ghostkit markers, so re-running this tool replaces it rather than appending a second copy. Do not apply these directives through sshmanager_update_domain \u2014 it returns success and renders them in its UI without them ever reaching ISPConfig or the disk."
     });
   }
 );

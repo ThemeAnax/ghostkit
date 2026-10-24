@@ -174,13 +174,32 @@ DBPASS="$(cat "$PWFILE")"
 # the literal early — a broken install at best, injected SQL at worst. Doubling
 # the quote and escaping the backslash is what MySQL expects.
 DBPASS_ESC=$(printf '%s' "$DBPASS" | sed "s/\\\\/\\\\\\\\/g; s/'/''/g")
+# Both hosts, one password. ISPConfig provisions the database user as
+# 'user'@'localhost' with a password of its own that it never hands back, and
+# MySQL treats 'localhost' and '127.0.0.1' as separate accounts. Granting only
+# 127.0.0.1 leaves that ISPConfig account sitting there with a different
+# password, and Ghost dies on ER_ACCESS_DENIED_ERROR for 'user'@'localhost' the
+# moment the driver resolves to the socket. ALTER on both makes them agree.
 mysql <<SQL
 CREATE DATABASE IF NOT EXISTS \`${DBNAME}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci;
 CREATE USER IF NOT EXISTS '${DBUSER}'@'127.0.0.1' IDENTIFIED BY '${DBPASS_ESC}';
 ALTER USER '${DBUSER}'@'127.0.0.1' IDENTIFIED BY '${DBPASS_ESC}';
 GRANT ALL PRIVILEGES ON \`${DBNAME}\`.* TO '${DBUSER}'@'127.0.0.1';
+CREATE USER IF NOT EXISTS '${DBUSER}'@'localhost' IDENTIFIED BY '${DBPASS_ESC}';
+ALTER USER '${DBUSER}'@'localhost' IDENTIFIED BY '${DBPASS_ESC}';
+GRANT ALL PRIVILEGES ON \`${DBNAME}\`.* TO '${DBUSER}'@'localhost';
 FLUSH PRIVILEGES;
 SQL
+
+# Prove the credential Ghost is about to be handed actually authenticates.
+# A mismatch that passes silently here resurfaces much later as a systemd unit
+# in a restart loop, which is a far more expensive thing to diagnose.
+for h in 127.0.0.1 localhost; do
+  if ! mysql -u "${DBUSER}" -p"${DBPASS}" -h "$h" -e "SELECT 1" "${DBNAME}" >/dev/null 2>&1; then
+    echo "ERROR: ${DBUSER}@${h} cannot authenticate against ${DBNAME} with the password just set." >&2
+    exit 1
+  fi
+done
 echo "==> database ${DBNAME} ready"
 
 # ---- install ----
