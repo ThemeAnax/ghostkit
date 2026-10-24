@@ -20,7 +20,9 @@ import {
   createAdminKey,
   installTheme,
   uploadRoutes,
+  uploadRoutesAsOwner,
   importContent,
+  contentCount,
   configureMail,
 } from "../core/ghost.js";
 import type { SiteLayout } from "../core/site.js";
@@ -37,7 +39,30 @@ import { applyBranding } from "../core/branding.js";
 import { EDITORS, detectAll, registerEditor, latestVersion, launchCommand, PACKAGE } from "../core/editors.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
-const VERSION = "0.5.0";
+
+/**
+ * Read the version rather than restating it. Hardcoding it here means a
+ * release can ship with the number from the one before — which it did: 0.6.0
+ * went out announcing itself as 0.5.0, so `version` reported an update that
+ * was already installed.
+ *
+ * dist/mcp/index.js and the esbuild bundle in plugin/ sit at different depths,
+ * so try both rather than assuming one layout.
+ */
+const VERSION: string = (() => {
+  for (const rel of ["../../package.json", "../package.json"]) {
+    try {
+      const p = resolve(here, rel);
+      if (existsSync(p)) {
+        const v = JSON.parse(readFileSync(p, "utf8")).version;
+        if (typeof v === "string" && v) return v;
+      }
+    } catch {
+      // try the next candidate
+    }
+  }
+  return "0.0.0";
+})();
 
 const server = new McpServer({ name: "ghostkit", version: VERSION });
 
@@ -468,13 +493,25 @@ server.registerTool(
     );
     if (found.stdout.trim()) {
       try {
-        const ok = await uploadRoutes(ssh, site.port, cfg.site.domain, cfg.admin.api_key, found.stdout.trim());
-        routes = ok ? "uploaded" : "rejected by Ghost";
+        // Owner session, not the API key: Ghost answers "API tokens do not
+        // have permission to access this endpoint" to a custom integration.
+        await uploadRoutesAsOwner(ssh, site.port, cfg.site.domain, cfg.admin, found.stdout.trim(), {
+          remote: true,
+        });
+        routes = "uploaded";
       } catch (e) {
         routes = `failed: ${(e as Error).message}`;
       }
     }
-    return json({ ok: true, theme, routes_yaml: routes ?? "none shipped with this theme" });
+    return json({
+      ok: true,
+      theme,
+      routes_yaml: routes ?? "none shipped with this theme",
+      routes_note:
+        routes || !cfg.content.routes
+          ? undefined
+          : "This theme ships no routes.yaml, but content.routes is set — import_content will upload that one.",
+    });
   },
 );
 
@@ -529,14 +566,26 @@ server.registerTool(
       "dropped if that theme is not active. Also uploads content.routes when set.",
     inputSchema: {
       dir: z.string().optional(),
-      source: z.string().optional().describe("Overrides content.source. Path to the export zip on THIS machine."),
-      routes: z.string().optional().describe("Overrides content.routes. Path to routes.yaml on THIS machine."),
+      source: z
+        .string()
+        .optional()
+        .describe('Overrides content.source. Path to the export zip on THIS machine. Pass "none" to skip the import and only do routes.'),
+      routes: z
+        .string()
+        .optional()
+        .describe('Overrides content.routes. Path to routes.yaml on THIS machine. Pass "none" to skip.'),
+      force: z
+        .boolean()
+        .optional()
+        .describe("Import even when the site already has content. Ghost APPENDS, so this duplicates it."),
     },
   },
-  async ({ dir, source, routes }) => {
+  async ({ dir, source, routes, force }) => {
     const { cfg, ssh } = sshFor(dir);
-    const src = source || cfg.content.source;
-    const routesSrc = routes || cfg.content.routes;
+    // "none" is how you skip one half explicitly; "" falls back to the config,
+    // which is what you want when the argument is simply absent.
+    const src = source === "none" ? "" : source || cfg.content.source;
+    const routesSrc = routes === "none" ? "" : routes || cfg.content.routes;
     if (!src && !routesSrc) {
       return json({ ok: true, skipped: "Neither content.source nor content.routes is set." });
     }
@@ -552,6 +601,22 @@ server.registerTool(
 
     let imported: Awaited<ReturnType<typeof importContent>> | undefined;
     if (src) {
+      // Ghost's importer APPENDS. Running this twice gives you two of every
+      // post, with no warning and no way to tell the copies apart afterwards.
+      if (!force) {
+        const existing = await contentCount(ssh, site.port, cfg.site.domain, cfg.admin);
+        if (existing.posts > 0 || existing.pages > 0) {
+          return json({
+            ok: false,
+            error: "site already has content",
+            counts: existing,
+            explanation:
+              "Ghost's importer appends rather than replaces, so importing again would duplicate every " +
+              "post and page. Pass force: true if that is genuinely what you want, or delete the existing " +
+              "content first.",
+          });
+        }
+      }
       imported = await importContent(ssh, site.port, cfg.site.domain, cfg.admin, src);
     }
 
@@ -559,18 +624,13 @@ server.registerTool(
     // install_theme never sees it and the theme's custom collections 404.
     let routesResult: string | undefined;
     if (routesSrc) {
-      if (!cfg.admin.api_key) {
-        routesResult = "skipped: admin.api_key is empty — run create_admin_key first";
-      } else {
-        const tmp = "/tmp/ghostkit-routes.yaml";
-        try {
-          await ssh.upload(routesSrc.replace(/^~(?=$|\/)/, homedir()), tmp);
-          const ok = await uploadRoutes(ssh, site.port, cfg.site.domain, cfg.admin.api_key, tmp);
-          await ssh.exec(`rm -f ${tmp}`);
-          routesResult = ok ? "uploaded" : "rejected by Ghost";
-        } catch (e) {
-          routesResult = `failed: ${(e as Error).message}`;
-        }
+      try {
+        await uploadRoutesAsOwner(ssh, site.port, cfg.site.domain, cfg.admin, routesSrc);
+        routesResult = "uploaded";
+      } catch (e) {
+        // Say what Ghost actually objected to; "rejected" on its own sends you
+        // looking at the YAML when the problem was the credential.
+        routesResult = `failed: ${(e as Error).message}`;
       }
     }
 

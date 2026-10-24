@@ -31002,7 +31002,6 @@ var StdioServerTransport = class {
 
 // src/mcp/index.ts
 import { existsSync as existsSync4, readFileSync as readFileSync3 } from "node:fs";
-import { homedir as homedir4 } from "node:os";
 import { dirname as dirname2, resolve as resolve2 } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -31421,8 +31420,9 @@ function adminJwt(adminApiKey) {
   const sig = createHmac("sha256", Buffer.from(secret, "hex")).update(`${head}.${body}`).digest("base64url");
   return `${head}.${body}.${sig}`;
 }
-function adminHeaders(domain2) {
-  return `-H ${shellQuote("Content-Type: application/json")} -H ${shellQuote(`Host: ${domain2}`)} -H ${shellQuote("Origin: https://" + domain2)} -H ${shellQuote("X-Forwarded-Proto: https")} `;
+function adminHeaders(domain2, opts = {}) {
+  const contentType = opts.json === false ? "" : `-H ${shellQuote("Content-Type: application/json")} `;
+  return contentType + `-H ${shellQuote(`Host: ${domain2}`)} -H ${shellQuote("Origin: https://" + domain2)} -H ${shellQuote("X-Forwarded-Proto: https")} `;
 }
 async function ownerCookie(ssh, port, domain2, owner) {
   const hdr = "/tmp/ghostkit-session-headers.txt";
@@ -31523,17 +31523,25 @@ async function updateSettings(ssh, port, domain2, adminApiKey, values) {
   }
   return Object.keys(values);
 }
-async function uploadRoutes(ssh, port, domain2, adminApiKey, remoteFile) {
-  const body = await multipart(
-    ssh,
-    port,
-    domain2,
-    adminApiKey,
-    "/ghost/api/admin/settings/routes/yaml/",
-    remoteFile,
-    "routes"
+async function uploadRoutesAsOwner(ssh, port, domain2, owner, file2, opts = {}) {
+  const tmp = "/tmp/ghostkit-routes.yaml";
+  if (opts.remote) {
+    await ssh.must(`cp ${shellQuote(file2)} ${tmp}`);
+  } else {
+    const local = resolvePath(file2.replace(/^~(?=$|\/)/, homedir2()));
+    if (!existsSync2(local)) throw new Error(`routes file not found: ${local}`);
+    await ssh.upload(local, tmp);
+  }
+  const cookie = await ownerCookie(ssh, port, domain2, owner);
+  const r = await ssh.exec(
+    `curl -sS -X POST ${adminHeaders(domain2, { json: false })}-H ${shellQuote(`Cookie: ${cookie}`)} -F ${shellQuote(`routes=@${tmp};type=application/x-yaml`)} ${shellQuote(`http://127.0.0.1:${port}/ghost/api/admin/settings/routes/yaml/`)}`,
+    { timeoutMs: 18e4 }
   );
-  return !/"errors"/.test(body);
+  await ssh.exec(`rm -f ${tmp}`);
+  if (/"errors"/.test(r.stdout)) {
+    throw new Error(`routes upload rejected: ${r.stdout.slice(0, 300)}`);
+  }
+  return true;
 }
 async function importContent(ssh, port, domain2, owner, localFile) {
   const local = resolvePath(localFile.replace(/^~(?=$|\/)/, homedir2()));
@@ -31545,9 +31553,11 @@ async function importContent(ssh, port, domain2, owner, localFile) {
   await ssh.must(`rm -rf ${tmpDir} && mkdir -p ${tmpDir}`);
   await ssh.upload(local, tmp);
   const cookie = await ownerCookie(ssh, port, domain2, owner);
-  const auth = `${adminHeaders(domain2)}-H ${shellQuote(`Cookie: ${cookie}`)} `;
+  const cookieHdr = `-H ${shellQuote(`Cookie: ${cookie}`)} `;
+  const upload = `${adminHeaders(domain2, { json: false })}${cookieHdr}`;
+  const auth = `${adminHeaders(domain2)}${cookieHdr}`;
   const r = await ssh.exec(
-    `curl -sS -X POST ${auth}-F ${shellQuote(`importfile=@${tmp};type=application/zip`)} ${shellQuote(`http://127.0.0.1:${port}/ghost/api/admin/db/`)}`,
+    `curl -sS -X POST ${upload}-F ${shellQuote(`importfile=@${tmp};type=application/zip`)} ${shellQuote(`http://127.0.0.1:${port}/ghost/api/admin/db/`)}`,
     { timeoutMs: 9e5 }
   );
   await ssh.exec(`rm -rf ${tmpDir}`);
@@ -31562,6 +31572,9 @@ async function importContent(ssh, port, domain2, owner, localFile) {
     if (e instanceof Error && e.message.startsWith("import failed")) throw e;
     throw new Error(`import returned something unreadable: ${r.stdout.slice(0, 400)}`);
   }
+  return { ok: true, problems, counts: await countsWith(ssh, port, auth) };
+}
+async function countsWith(ssh, port, auth) {
   const count = async (res) => {
     const out = await ssh.exec(
       `curl -sS ${auth}${shellQuote(`http://127.0.0.1:${port}/ghost/api/admin/${res}/?limit=1&formats=`)}`
@@ -31573,15 +31586,15 @@ async function importContent(ssh, port, domain2, owner, localFile) {
     }
   };
   return {
-    ok: true,
-    problems,
-    counts: {
-      posts: await count("posts"),
-      pages: await count("pages"),
-      tags: await count("tags"),
-      users: await count("users")
-    }
+    posts: await count("posts"),
+    pages: await count("pages"),
+    tags: await count("tags"),
+    users: await count("users")
   };
+}
+async function contentCount(ssh, port, domain2, owner) {
+  const cookie = await ownerCookie(ssh, port, domain2, owner);
+  return countsWith(ssh, port, `${adminHeaders(domain2)}-H ${shellQuote(`Cookie: ${cookie}`)} `);
 }
 async function configureMail(ssh, site, opts) {
   const cfg = [
@@ -32030,7 +32043,19 @@ async function latestVersion() {
 
 // src/mcp/index.ts
 var here = dirname2(fileURLToPath(import.meta.url));
-var VERSION = "0.5.0";
+var VERSION = (() => {
+  for (const rel of ["../../package.json", "../package.json"]) {
+    try {
+      const p = resolve2(here, rel);
+      if (existsSync4(p)) {
+        const v = JSON.parse(readFileSync3(p, "utf8")).version;
+        if (typeof v === "string" && v) return v;
+      }
+    } catch {
+    }
+  }
+  return "0.0.0";
+})();
 var server = new McpServer({ name: "ghostkit", version: VERSION });
 var text = (s) => ({ content: [{ type: "text", text: s }] });
 var json2 = (o) => text(JSON.stringify(o, null, 2));
@@ -32358,13 +32383,20 @@ server.registerTool(
     );
     if (found.stdout.trim()) {
       try {
-        const ok = await uploadRoutes(ssh, site.port, cfg.site.domain, cfg.admin.api_key, found.stdout.trim());
-        routes = ok ? "uploaded" : "rejected by Ghost";
+        await uploadRoutesAsOwner(ssh, site.port, cfg.site.domain, cfg.admin, found.stdout.trim(), {
+          remote: true
+        });
+        routes = "uploaded";
       } catch (e) {
         routes = `failed: ${e.message}`;
       }
     }
-    return json2({ ok: true, theme, routes_yaml: routes ?? "none shipped with this theme" });
+    return json2({
+      ok: true,
+      theme,
+      routes_yaml: routes ?? "none shipped with this theme",
+      routes_note: routes || !cfg.content.routes ? void 0 : "This theme ships no routes.yaml, but content.routes is set \u2014 import_content will upload that one."
+    });
   }
 );
 server.registerTool(
@@ -32407,14 +32439,15 @@ server.registerTool(
     description: "Import the universal-import zip at content.source \u2014 posts, pages, tags, staff and their uploaded files \u2014 and report what landed. Runs through an OWNER session: Ghost restricts importContent to owner/admin users and does not grant it to custom integrations, so the Admin API key every other tool here uses is refused with 'You do not have permission to importContent db'. Install and activate the theme FIRST \u2014 a theme's demo content carries settings keyed to the theme's name, and those are dropped if that theme is not active. Also uploads content.routes when set.",
     inputSchema: {
       dir: external_exports.string().optional(),
-      source: external_exports.string().optional().describe("Overrides content.source. Path to the export zip on THIS machine."),
-      routes: external_exports.string().optional().describe("Overrides content.routes. Path to routes.yaml on THIS machine.")
+      source: external_exports.string().optional().describe('Overrides content.source. Path to the export zip on THIS machine. Pass "none" to skip the import and only do routes.'),
+      routes: external_exports.string().optional().describe('Overrides content.routes. Path to routes.yaml on THIS machine. Pass "none" to skip.'),
+      force: external_exports.boolean().optional().describe("Import even when the site already has content. Ghost APPENDS, so this duplicates it.")
     }
   },
-  async ({ dir, source, routes }) => {
+  async ({ dir, source, routes, force }) => {
     const { cfg, ssh } = sshFor(dir);
-    const src = source || cfg.content.source;
-    const routesSrc = routes || cfg.content.routes;
+    const src = source === "none" ? "" : source || cfg.content.source;
+    const routesSrc = routes === "none" ? "" : routes || cfg.content.routes;
     if (!src && !routesSrc) {
       return json2({ ok: true, skipped: "Neither content.source nor content.routes is set." });
     }
@@ -32427,22 +32460,26 @@ server.registerTool(
     const site = await resolveSite(ssh, cfg.site.domain);
     let imported;
     if (src) {
+      if (!force) {
+        const existing = await contentCount(ssh, site.port, cfg.site.domain, cfg.admin);
+        if (existing.posts > 0 || existing.pages > 0) {
+          return json2({
+            ok: false,
+            error: "site already has content",
+            counts: existing,
+            explanation: "Ghost's importer appends rather than replaces, so importing again would duplicate every post and page. Pass force: true if that is genuinely what you want, or delete the existing content first."
+          });
+        }
+      }
       imported = await importContent(ssh, site.port, cfg.site.domain, cfg.admin, src);
     }
     let routesResult;
     if (routesSrc) {
-      if (!cfg.admin.api_key) {
-        routesResult = "skipped: admin.api_key is empty \u2014 run create_admin_key first";
-      } else {
-        const tmp = "/tmp/ghostkit-routes.yaml";
-        try {
-          await ssh.upload(routesSrc.replace(/^~(?=$|\/)/, homedir4()), tmp);
-          const ok = await uploadRoutes(ssh, site.port, cfg.site.domain, cfg.admin.api_key, tmp);
-          await ssh.exec(`rm -f ${tmp}`);
-          routesResult = ok ? "uploaded" : "rejected by Ghost";
-        } catch (e) {
-          routesResult = `failed: ${e.message}`;
-        }
+      try {
+        await uploadRoutesAsOwner(ssh, site.port, cfg.site.domain, cfg.admin, routesSrc);
+        routesResult = "uploaded";
+      } catch (e) {
+        routesResult = `failed: ${e.message}`;
       }
     }
     return json2({

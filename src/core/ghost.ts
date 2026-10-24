@@ -254,9 +254,13 @@ export function adminJwt(adminApiKey: string): string {
  * ISSUE a Secure cookie on a connection it believes is plain http — which
  * every loopback call is. In production the vhost sets it; here we must.
  */
-function adminHeaders(domain: string): string {
+function adminHeaders(domain: string, opts: { json?: boolean } = {}): string {
+  // A multipart upload must NOT carry this: curl generates its own
+  // Content-Type with the boundary it chose, and overriding it leaves Ghost
+  // parsing a multipart body as JSON — "Unexpected token '-', \"------\"".
+  const contentType = opts.json === false ? "" : `-H ${shellQuote("Content-Type: application/json")} `;
   return (
-    `-H ${shellQuote("Content-Type: application/json")} ` +
+    contentType +
     `-H ${shellQuote(`Host: ${domain}`)} ` +
     `-H ${shellQuote("Origin: https://" + domain)} ` +
     `-H ${shellQuote("X-Forwarded-Proto: https")} `
@@ -472,6 +476,47 @@ export async function uploadRoutes(
   return !/"errors"/.test(body);
 }
 
+/**
+ * Upload routes.yaml as the owner.
+ *
+ * Same limit as importContent: this endpoint answers "API tokens do not have
+ * permission to access this endpoint" to a custom integration's Admin API key,
+ * so uploadRoutes (which uses that key) only works for routes.yaml that ships
+ * INSIDE a theme, where Ghost applies it on activation instead.
+ */
+export async function uploadRoutesAsOwner(
+  ssh: Ssh,
+  port: number,
+  domain: string,
+  owner: { email: string; password: string },
+  file: string,
+  opts: { remote?: boolean } = {},
+): Promise<boolean> {
+  const tmp = "/tmp/ghostkit-routes.yaml";
+  if (opts.remote) {
+    // Already on the host — a theme's own routes.yaml, found by ls.
+    await ssh.must(`cp ${shellQuote(file)} ${tmp}`);
+  } else {
+    const local = resolvePath(file.replace(/^~(?=$|\/)/, homedir()));
+    if (!existsSync(local)) throw new Error(`routes file not found: ${local}`);
+    await ssh.upload(local, tmp);
+  }
+
+  const cookie = await ownerCookie(ssh, port, domain, owner);
+  const r = await ssh.exec(
+    `curl -sS -X POST ${adminHeaders(domain, { json: false })}` +
+      `-H ${shellQuote(`Cookie: ${cookie}`)} ` +
+      `-F ${shellQuote(`routes=@${tmp};type=application/x-yaml`)} ` +
+      `${shellQuote(`http://127.0.0.1:${port}/ghost/api/admin/settings/routes/yaml/`)}`,
+    { timeoutMs: 180_000 },
+  );
+  await ssh.exec(`rm -f ${tmp}`);
+  if (/"errors"/.test(r.stdout)) {
+    throw new Error(`routes upload rejected: ${r.stdout.slice(0, 300)}`);
+  }
+  return true;
+}
+
 export interface ImportResult {
   ok: boolean;
   problems: unknown[];
@@ -505,11 +550,13 @@ export async function importContent(
   await ssh.upload(local, tmp);
 
   const cookie = await ownerCookie(ssh, port, domain, owner);
-  const auth = `${adminHeaders(domain)}-H ${shellQuote(`Cookie: ${cookie}`)} `;
+  const cookieHdr = `-H ${shellQuote(`Cookie: ${cookie}`)} `;
+  const upload = `${adminHeaders(domain, { json: false })}${cookieHdr}`;
+  const auth = `${adminHeaders(domain)}${cookieHdr}`;
 
   // A large import with images can run for minutes.
   const r = await ssh.exec(
-    `curl -sS -X POST ${auth}` +
+    `curl -sS -X POST ${upload}` +
       `-F ${shellQuote(`importfile=@${tmp};type=application/zip`)} ` +
       `${shellQuote(`http://127.0.0.1:${port}/ghost/api/admin/db/`)}`,
     { timeoutMs: 900_000 },
@@ -529,6 +576,11 @@ export async function importContent(
   }
 
   // Count what actually landed rather than trusting an empty problems array.
+  return { ok: true, problems, counts: await countsWith(ssh, port, auth) };
+}
+
+/** Totals straight from each resource's pagination, with one cookie. */
+async function countsWith(ssh: Ssh, port: number, auth: string): Promise<ImportResult["counts"]> {
   const count = async (res: string): Promise<number> => {
     const out = await ssh.exec(
       `curl -sS ${auth}${shellQuote(`http://127.0.0.1:${port}/ghost/api/admin/${res}/?limit=1&formats=`)}`,
@@ -539,17 +591,26 @@ export async function importContent(
       return 0;
     }
   };
-
   return {
-    ok: true,
-    problems,
-    counts: {
-      posts: await count("posts"),
-      pages: await count("pages"),
-      tags: await count("tags"),
-      users: await count("users"),
-    },
+    posts: await count("posts"),
+    pages: await count("pages"),
+    tags: await count("tags"),
+    users: await count("users"),
   };
+}
+
+/**
+ * What is already on the site. Checked before importing, because Ghost's
+ * importer appends: a second import silently doubles everything.
+ */
+export async function contentCount(
+  ssh: Ssh,
+  port: number,
+  domain: string,
+  owner: { email: string; password: string },
+): Promise<ImportResult["counts"]> {
+  const cookie = await ownerCookie(ssh, port, domain, owner);
+  return countsWith(ssh, port, `${adminHeaders(domain)}-H ${shellQuote(`Cookie: ${cookie}`)} `);
 }
 
 /**
