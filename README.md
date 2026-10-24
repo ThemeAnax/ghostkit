@@ -231,9 +231,39 @@ a Secure cookie on a connection it believes is plain http. `mod_proxy` does not 
 **201 with no `Set-Cookie`** and the admin UI simply spins — a success status and a
 completely broken login.
 
-This is why `publish_site` tells you to use `sshmanager_update_domain` and **not**
-`sshmanager_set_domain_port`: the latter regenerates its own proxy block and drops the
-header.
+`publish_site` writes this into the vhost itself, configtests, and reloads — it does not
+hand you a block to apply elsewhere, because the obvious route for that
+(`sshmanager_set_domain_port`) regenerates its own proxy block and drops the header.
+</details>
+
+<details>
+<summary><strong>Never pass <code>ip_address</code> when provisioning the domain</strong></summary>
+
+The one trap ghostkit cannot protect you from, because it happens before ghostkit is
+involved — in `sshmanager_provision_domain`, or in the ISPConfig panel.
+
+An explicit IP makes ISPConfig emit `<VirtualHost 192.0.2.1:443>`. Every other site on a
+shared host uses `<VirtualHost *:443>`, and **an IP-literal vhost outranks every wildcard
+one on the same address** — so the new site silently becomes the default for *every*
+hostname on that IP. Visitors to unrelated domains get your site, and HTTPS throws
+certificate-mismatch errors because your cert does not cover their hostnames.
+
+The symptom looks nothing like the cause: other people's sites break, yours looks fine.
+
+Worse, the value **persists in ISPConfig's `web_domain` row**. Fixing the vhost file by
+hand works until the next time ISPConfig regenerates it — which any directive update
+does — and then the binding comes straight back. The real fix is the panel value: set
+the site's IPv4 address to `*`, as every other site on the host has it.
+
+Check after provisioning. Empty output is correct:
+
+```sh
+sshcon exec <host> -- 'apache2ctl -S | grep -E "^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+:"'
+```
+
+`publish_site` rewrites an IP-bound vhost to a wildcard and reports `rebound_to_wildcard`,
+but that is a safety net for the file only: between provisioning and publishing the
+hijack is live, and the panel value still needs correcting.
 </details>
 
 <details>
