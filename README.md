@@ -129,6 +129,8 @@ Everything except `site.domain`, `admin.name` and `admin.email` is optional:
 - `theme.source` — a local zip path or an http(s) URL. Blank keeps Ghost's default theme.
 - `branding.accent_color` — blank derives a stable colour from the title.
 - `author` — byline for generated content; themeseed asks per blog without it.
+- `content.source` — a Ghost export to import: a `.json`, or a `.zip` holding that json
+  alongside `content/images/…`. A bare `.json` brings no images with it.
 - `admin.api_key` and `admin.password` are **written by** ghostkit, not filled in by you.
 
 Leave `admin.password` blank and ghostkit generates a 20-character one, writes it back to

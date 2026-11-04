@@ -571,8 +571,8 @@ server.registerTool(
   {
     title: "Import a Ghost export (demo content) into the site",
     description:
-      "Import the universal-import zip at content.source — posts, pages, tags, staff and their uploaded " +
-      "files — and report what landed. Runs through an OWNER session: Ghost restricts importContent to " +
+      "Import the universal-import export at content.source — a .json export, or a .zip carrying the " +
+      "json plus its content/images — and report what landed. Runs through an OWNER session: Ghost restricts importContent to " +
       "owner/admin users and does not grant it to custom integrations, so the Admin API key every other " +
       "tool here uses is refused with 'You do not have permission to importContent db'. Install and activate " +
       "the theme FIRST — a theme's demo content carries settings keyed to the theme's name, and those are " +
@@ -582,7 +582,7 @@ server.registerTool(
       source: z
         .string()
         .optional()
-        .describe('Overrides content.source. Path to the export zip on THIS machine. Pass "none" to skip the import and only do routes.'),
+        .describe('Overrides content.source. Path on THIS machine to the export — .json or .zip; a bare .json carries no images. Pass "none" to skip the import and only do routes.'),
       routes: z
         .string()
         .optional()

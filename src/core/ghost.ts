@@ -544,8 +544,13 @@ export async function importContent(
   if (!existsSync(local)) {
     throw new Error(`import file not found: ${local}`);
   }
+  // Ghost's Universal import takes a JSON export or a zip, and picks the handler
+  // from the filename and the content type. Upload under the extension the file
+  // actually has: a .json renamed to content.zip reaches the zip handler and fails.
+  const json = local.toLowerCase().endsWith(".json");
+  const mime = json ? "application/json" : "application/zip";
   const tmpDir = "/tmp/ghostkit-import";
-  const tmp = `${tmpDir}/content.zip`;
+  const tmp = `${tmpDir}/content.${json ? "json" : "zip"}`;
   await ssh.must(`rm -rf ${tmpDir} && mkdir -p ${tmpDir}`);
   await ssh.upload(local, tmp);
 
@@ -557,7 +562,7 @@ export async function importContent(
   // A large import with images can run for minutes.
   const r = await ssh.exec(
     `curl -sS -X POST ${upload}` +
-      `-F ${shellQuote(`importfile=@${tmp};type=application/zip`)} ` +
+      `-F ${shellQuote(`importfile=@${tmp};type=${mime}`)} ` +
       `${shellQuote(`http://127.0.0.1:${port}/ghost/api/admin/db/`)}`,
     { timeoutMs: 900_000 },
   );
