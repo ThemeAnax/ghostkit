@@ -33,6 +33,8 @@ import {
   restartGhost,
   applyVhost,
   ipBoundVhosts,
+  ispconfigIpBinding,
+  repairIpBinding,
   checkGhostPort,
   suggestGhostPort,
   GHOST_PORT_MIN,
@@ -252,6 +254,22 @@ server.registerTool(
     // 0600: this write is what puts the database password in the file.
     writeConfigFile(path, raw);
 
+    // Earliest point ghostkit can see a freshly provisioned site. Provisioning
+    // defaults a new site to the host's literal IP instead of "*", and such a
+    // vhost outranks every wildcard one on the address — the new site starts
+    // answering for every hostname on the box within seconds of being created,
+    // long before preflight or publish_site would have caught it. Report it
+    // here so the window is seconds rather than a whole install.
+    let ipBinding: string | null = null;
+    const domain = (raw.site?.domain as string) || "";
+    if (domain) {
+      try {
+        ipBinding = await ispconfigIpBinding(sshFor(dir).ssh, domain);
+      } catch {
+        // No usable SSH yet is normal mid-provision; preflight checks again.
+      }
+    }
+
     const mask = (v: string) => (v ? `${v.slice(0, 3)}***(${v.length})` : "");
     return json({
       ok: true,
@@ -276,8 +294,58 @@ server.registerTool(
               `later and drop every PHP site on the host. install_ghost will pick a safe port.`
           : undefined,
         database: { name: s.database.name, user: s.database.user, password: mask(s.database.password) },
+        ip_binding: ipBinding ?? undefined,
+        ip_binding_note:
+          ipBinding && ipBinding !== "*"
+            ? `STOP — this site is bound to ${ipBinding} instead of "*", so it is ALREADY answering for every ` +
+              `other hostname on this host: they get this site's certificate and then a 403. Run ` +
+              `repair_ip_binding on this domain before anything else, then carry on. Provisioning defaults to ` +
+              `the host's literal IP, so pass ip_address "*" when creating the site to avoid this entirely.`
+            : undefined,
       },
       still_required: missingFields(raw),
+    });
+  },
+);
+
+server.registerTool(
+  "repair_ip_binding",
+  {
+    title: "Put a site back on a wildcard IP binding",
+    description:
+      "Fixes a site that binds a literal IP instead of '*', cause first: sets ISPConfig's ip_address column " +
+      "back to '*', then rewrites any IP-bound <VirtualHost> on disk to a wildcard and reloads Apache once " +
+      "the config still parses. Apache matches an IP-bound vhost ahead of every wildcard one on the same " +
+      "address, so a single such site answers for EVERY hostname on the host — wrong certificate, then 403. " +
+      "Rewriting only the file is not enough: the panel regenerates the vhost from that column and the fault " +
+      "returns later under a different site's name. Safe to run when nothing is wrong; it reports that nothing " +
+      "needed doing.",
+    inputSchema: {
+      dir: z.string().optional(),
+      domain: z.string().optional().describe("Overrides site.domain from the config."),
+    },
+  },
+  async ({ dir, domain }) => {
+    const { cfg, ssh } = sshFor(dir);
+    const target = domain || cfg.site.domain;
+    const r = await repairIpBinding(ssh, target);
+    const strays = await ipBoundVhosts(ssh);
+    return json({
+      ok: true,
+      domain: target,
+      was_bound_to: r.wasBound ?? undefined,
+      vhosts_rewritten: r.files.length ? r.files : undefined,
+      apache_reloaded: r.reloaded,
+      changed: r.wasBound !== null || r.files.length > 0,
+      note:
+        r.wasBound === null && r.files.length === 0
+          ? "Already on a wildcard binding — nothing to do."
+          : undefined,
+      remaining_ip_bound_vhosts: strays.length ? strays : undefined,
+      remaining_note: strays.length
+        ? "Other sites on this host still bind a literal IP and will cause the same outage. Run " +
+          "repair_ip_binding for each of them."
+        : undefined,
     });
   },
 );

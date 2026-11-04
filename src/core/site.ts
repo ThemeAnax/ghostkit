@@ -207,9 +207,10 @@ export async function applyVhost(
       `This domain's vhost is bound to a literal IP, so nothing was written:\n  ${ipBound.join("\n  ")}\n\n` +
         `Apache matches an IP-bound <VirtualHost> before any wildcard one on that address, which makes this ` +
         `site the default for EVERY hostname on the box — other sites get this certificate and a 403.\n\n` +
-        `Fix it in ISPConfig: set the site's IP to "*" (Sites > the domain > IPv4 Address), which regenerates ` +
-        `the vhost as <VirtualHost *:80> / <VirtualHost *:443>. Editing the file is not a fix — ISPConfig ` +
-        `rewrites it. Pass rebind:true only as a stopgap until the panel setting is corrected.`,
+        `Fix the cause, not the file: the panel's ip_address column is what generates this vhost, so editing ` +
+        `the file is undone by the next regeneration. Run repair_ip_binding on this domain, or set the site's ` +
+        `IPv4 Address to "*" in ISPConfig (Sites > the domain). rebind:true rewrites the file only and is a ` +
+        `stopgap — it leaves the column wrong and the fault returns.`,
     );
   }
 
@@ -288,6 +289,85 @@ export async function ipBoundVhosts(ssh: Ssh): Promise<string[]> {
     `apache2ctl -S 2>/dev/null | awk '/^[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+:[0-9]+/ {print $NF}' | sort -u || true`,
   );
   return r.stdout.trim().split("\n").filter(Boolean);
+}
+
+/**
+ * The panel's own record of which address a site binds to. ISPConfig generates
+ * the vhost from this column, so the file on disk is the symptom and this is
+ * the cause.
+ *
+ * Returns the stored value — "*" when correct — or null when the panel has no
+ * row for this domain.
+ */
+export async function ispconfigIpBinding(ssh: Ssh, domain: string): Promise<string | null> {
+  const q = shellQuote(domain);
+  const r = await ssh.exec(
+    `mysql -N -B -e "SELECT ip_address FROM dbispconfig.web_domain WHERE domain=${q} LIMIT 1;" 2>/dev/null`,
+  );
+  const v = r.stdout.trim();
+  return v === "" ? null : v;
+}
+
+export interface IpRepair {
+  /** The literal IP that was stored, or null when nothing needed doing. */
+  wasBound: string | null;
+  /** Vhost files rewritten from the IP to a wildcard. */
+  files: string[];
+  /** Apache picked up the rewritten files. */
+  reloaded: boolean;
+}
+
+/**
+ * Put a site back on a wildcard binding, cause first.
+ *
+ * Provisioning defaults a new site to the host's literal IP rather than "*",
+ * and Apache matches an IP-bound <VirtualHost> ahead of every wildcard one on
+ * that address — so one freshly provisioned site answers for every hostname on
+ * the box, handing out its own certificate and then a 403. On server4 this took
+ * all 38 other sites down, twice in one day.
+ *
+ * Both halves are needed and the order matters. Rewriting the file alone is
+ * what was tried the first time: the panel regenerated it hours later and the
+ * same outage came back under a different site's name. Fixing the column alone
+ * leaves the bad file serving traffic until something happens to regenerate it.
+ */
+export async function repairIpBinding(ssh: Ssh, domain: string): Promise<IpRepair> {
+  const stored = await ispconfigIpBinding(ssh, domain);
+  const q = shellQuote(domain);
+
+  if (stored !== null && stored !== "*") {
+    await ssh.must(
+      `mysql -e "UPDATE dbispconfig.web_domain SET ip_address='*' WHERE domain=${q};" 2>/dev/null`,
+    );
+  }
+
+  const found = await ssh.exec(
+    `ls /etc/apache2/sites-available/*${q}*.vhost 2>/dev/null | sort -u || true`,
+  );
+  const rewritten: string[] = [];
+  for (const file of found.stdout.trim().split("\n").filter(Boolean)) {
+    const f = shellQuote(file);
+    const bound = await ssh.exec(`grep -cE '^[[:space:]]*<VirtualHost[[:space:]]+[0-9]' ${f} || true`);
+    if (Number(bound.stdout.trim()) === 0) continue;
+    await ssh.must(`cp -a ${f} ${shellQuote(`${file}.ghostkit.${Date.now()}`)}`);
+    await ssh.must(
+      `sed -i -E 's|^([[:space:]]*)<VirtualHost[[:space:]]+[0-9][0-9.]*:|\\1<VirtualHost *:|' ${f}`,
+    );
+    rewritten.push(file);
+  }
+
+  let reloaded = false;
+  if (rewritten.length > 0) {
+    // Never reload on a config this edit broke: that would take the whole host
+    // down instead of the one site.
+    const test = await ssh.exec(`apache2ctl configtest 2>&1`);
+    if (/Syntax OK/.test(test.stdout + test.stderr)) {
+      await ssh.must(`systemctl reload apache2`);
+      reloaded = true;
+    }
+  }
+
+  return { wasBound: stored !== null && stored !== "*" ? stored : null, files: rewritten, reloaded };
 }
 
 /** Restart Ghost through the tenant's own systemd user manager — never root. */
