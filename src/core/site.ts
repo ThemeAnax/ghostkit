@@ -54,6 +54,65 @@ export async function resolveSite(ssh: Ssh, domain: string): Promise<SiteLayout>
 }
 
 /**
+ * Ghost's loopback ports live in 51000–51999, and nowhere else.
+ *
+ * ISPConfig hands out PHP-FPM pool ports from 9000–9099, one per new PHP site,
+ * and it does not know Ghost exists. Put a Ghost site in that range and the next
+ * PHP site created on the box is given the same port: php-fpm then cannot bind
+ * its pool, systemd fails the WHOLE php-fpm service, and every PHP site on the
+ * host goes down with it. This happened on server4 — a Ghost site held 9047,
+ * which ISPConfig later assigned to another site's pool.
+ */
+export const GHOST_PORT_MIN = 51000;
+export const GHOST_PORT_MAX = 51999;
+export const FPM_PORT_MIN = 9000;
+export const FPM_PORT_MAX = 9099;
+
+export interface PortVerdict {
+  port: number;
+  ok: boolean;
+  problems: string[];
+  listening: boolean;
+}
+
+/** Is this port safe to hand Ghost on this host? Range, FPM range, and in-use. */
+export async function checkGhostPort(ssh: Ssh, port: number): Promise<PortVerdict> {
+  const problems: string[] = [];
+  if (!Number.isInteger(port) || port <= 0) {
+    problems.push(`'${port}' is not a port number.`);
+  }
+  if (port >= FPM_PORT_MIN && port <= FPM_PORT_MAX) {
+    problems.push(
+      `${port} is inside ISPConfig's PHP-FPM pool range ${FPM_PORT_MIN}–${FPM_PORT_MAX}. The next PHP site ` +
+        `created here will be given this port, php-fpm will fail to bind it, and systemd will take the whole ` +
+        `php-fpm service — every PHP site on the host — down with it.`,
+    );
+  }
+  if (port < GHOST_PORT_MIN || port > GHOST_PORT_MAX) {
+    problems.push(`${port} is outside the Ghost range ${GHOST_PORT_MIN}–${GHOST_PORT_MAX}.`);
+  }
+  const r = await ssh.exec(`ss -tln 2>/dev/null | grep -c ":${port} " || true`);
+  const listening = Number(r.stdout.trim()) > 0;
+  if (listening) problems.push(`Something is already listening on ${port}.`);
+  return { port, ok: problems.length === 0, problems, listening };
+}
+
+/**
+ * The next free Ghost port: one above the highest already in the range, taken
+ * from the site registry and from what is actually listening.
+ */
+export async function suggestGhostPort(ssh: Ssh): Promise<number> {
+  const r = await ssh.exec(
+    `{ awk -F'\\t' 'NR>1{print $1}' /etc/ghost/sites.tsv 2>/dev/null; ` +
+      `ss -tln 2>/dev/null | grep -oE '127\\.0\\.0\\.1:[0-9]+' | cut -d: -f2; } | ` +
+      `awk -v lo=${GHOST_PORT_MIN} -v hi=${GHOST_PORT_MAX} '$1>=lo && $1<=hi' | sort -n | tail -1`,
+  );
+  const highest = Number(r.stdout.trim());
+  if (!Number.isFinite(highest) || highest < GHOST_PORT_MIN) return GHOST_PORT_MIN;
+  return highest + 1;
+}
+
+/**
  * The vhost block. Every line here is load-bearing — see the comments; each
  * one corresponds to a way the site breaks without it.
  */
@@ -116,7 +175,7 @@ export async function applyVhost(
   ssh: Ssh,
   domain: string,
   directives: string,
-  opts: { reload?: boolean } = {},
+  opts: { reload?: boolean; rebind?: boolean } = {},
 ): Promise<VhostResult> {
   const q = shellQuote(domain);
   const found = await ssh.exec(
@@ -126,6 +185,31 @@ export async function applyVhost(
   if (files.length === 0) {
     throw new Error(
       `No Apache vhost found for '${domain}'. Create the website in ISPConfig first, then run this again.`,
+    );
+  }
+
+  // An IP-literal <VirtualHost> forms its own matching set for that address, and
+  // every request arriving on the IP matches that set first — so one IP-bound
+  // vhost answers for every other site on the box, serving its own certificate
+  // and then a 403 because the Host header does not match. On server4 this took
+  // all 36 Ghost sites down at once. ISPConfig regenerates these files from the
+  // site's IP setting in the panel, so editing the file here only hides it until
+  // the next regeneration: refuse, and say where the real setting lives.
+  const ipBound: string[] = [];
+  for (const file of files) {
+    const bound = await ssh.exec(
+      `grep -hoE '<VirtualHost[[:space:]]+[0-9][0-9.]*:[0-9]+' ${shellQuote(file)} | sort -u || true`,
+    );
+    if (bound.stdout.trim()) ipBound.push(`${file}: ${bound.stdout.trim().split("\n").join(", ")}`);
+  }
+  if (ipBound.length > 0 && !opts.rebind) {
+    throw new Error(
+      `This domain's vhost is bound to a literal IP, so nothing was written:\n  ${ipBound.join("\n  ")}\n\n` +
+        `Apache matches an IP-bound <VirtualHost> before any wildcard one on that address, which makes this ` +
+        `site the default for EVERY hostname on the box — other sites get this certificate and a 403.\n\n` +
+        `Fix it in ISPConfig: set the site's IP to "*" (Sites > the domain > IPv4 Address), which regenerates ` +
+        `the vhost as <VirtualHost *:80> / <VirtualHost *:443>. Editing the file is not a fix — ISPConfig ` +
+        `rewrites it. Pass rebind:true only as a stopgap until the panel setting is corrected.`,
     );
   }
 
@@ -144,8 +228,8 @@ export async function applyVhost(
     await ssh.must(`cp -a ${f} ${shellQuote(stamp)}`);
     backups.push(stamp);
 
-    // An IP-literal <VirtualHost> wins over a wildcard one on the same address,
-    // which would make this site answer for every other domain on the host.
+    // Only reached with rebind:true — a stopgap that lasts until ISPConfig
+    // regenerates the file from the site's IP setting in the panel.
     const bound = await ssh.exec(`grep -cE '^[[:space:]]*<VirtualHost[[:space:]]+[0-9]' ${f} || true`);
     if (Number(bound.stdout.trim()) > 0) {
       await ssh.must(

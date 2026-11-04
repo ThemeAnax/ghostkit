@@ -31556,8 +31556,10 @@ async function importContent(ssh, port, domain2, owner, localFile) {
   if (!existsSync2(local)) {
     throw new Error(`import file not found: ${local}`);
   }
+  const json3 = local.toLowerCase().endsWith(".json");
+  const mime = json3 ? "application/json" : "application/zip";
   const tmpDir = "/tmp/ghostkit-import";
-  const tmp = `${tmpDir}/content.zip`;
+  const tmp = `${tmpDir}/content.${json3 ? "json" : "zip"}`;
   await ssh.must(`rm -rf ${tmpDir} && mkdir -p ${tmpDir}`);
   await ssh.upload(local, tmp);
   const cookie = await ownerCookie(ssh, port, domain2, owner);
@@ -31565,7 +31567,7 @@ async function importContent(ssh, port, domain2, owner, localFile) {
   const upload = `${adminHeaders(domain2, { json: false })}${cookieHdr}`;
   const auth = `${adminHeaders(domain2)}${cookieHdr}`;
   const r = await ssh.exec(
-    `curl -sS -X POST ${upload}-F ${shellQuote(`importfile=@${tmp};type=application/zip`)} ${shellQuote(`http://127.0.0.1:${port}/ghost/api/admin/db/`)}`,
+    `curl -sS -X POST ${upload}-F ${shellQuote(`importfile=@${tmp};type=${mime}`)} ${shellQuote(`http://127.0.0.1:${port}/ghost/api/admin/db/`)}`,
     { timeoutMs: 9e5 }
   );
   await ssh.exec(`rm -rf ${tmpDir}`);
@@ -32445,10 +32447,10 @@ server.registerTool(
   "import_content",
   {
     title: "Import a Ghost export (demo content) into the site",
-    description: "Import the universal-import zip at content.source \u2014 posts, pages, tags, staff and their uploaded files \u2014 and report what landed. Runs through an OWNER session: Ghost restricts importContent to owner/admin users and does not grant it to custom integrations, so the Admin API key every other tool here uses is refused with 'You do not have permission to importContent db'. Install and activate the theme FIRST \u2014 a theme's demo content carries settings keyed to the theme's name, and those are dropped if that theme is not active. Also uploads content.routes when set.",
+    description: "Import the universal-import export at content.source \u2014 a .json export, or a .zip carrying the json plus its content/images \u2014 and report what landed. Runs through an OWNER session: Ghost restricts importContent to owner/admin users and does not grant it to custom integrations, so the Admin API key every other tool here uses is refused with 'You do not have permission to importContent db'. Install and activate the theme FIRST \u2014 a theme's demo content carries settings keyed to the theme's name, and those are dropped if that theme is not active. Also uploads content.routes when set.",
     inputSchema: {
       dir: external_exports.string().optional(),
-      source: external_exports.string().optional().describe('Overrides content.source. Path to the export zip on THIS machine. Pass "none" to skip the import and only do routes.'),
+      source: external_exports.string().optional().describe('Overrides content.source. Path on THIS machine to the export \u2014 .json or .zip; a bare .json carries no images. Pass "none" to skip the import and only do routes.'),
       routes: external_exports.string().optional().describe('Overrides content.routes. Path to routes.yaml on THIS machine. Pass "none" to skip.'),
       force: external_exports.boolean().optional().describe("Import even when the site already has content. Ghost APPENDS, so this duplicates it.")
     }

@@ -8,7 +8,14 @@
 set -euo pipefail
 
 REGISTRY=/etc/ghost/sites.tsv
-PORT_BASE=50001
+# Ghost lives in 51000-51999. ISPConfig allocates PHP-FPM pool ports from
+# 9000-9099 for every new PHP site and knows nothing about Ghost: a Ghost site
+# inside that range is handed out again, php-fpm cannot bind its pool, and
+# systemd drops the whole php-fpm service with every PHP site on the host.
+PORT_BASE=51000
+PORT_MAX=51999
+FPM_MIN=9000
+FPM_MAX=9099
 DOMAIN=""; PORT=""; GHOST_VERSION=""; WIPE=0
 DBNAME_OVERRIDE=""; DBUSER_OVERRIDE=""; DBPASS_OVERRIDE=""
 
@@ -100,7 +107,19 @@ elif [ -z "$PORT" ]; then
   PORT=$PORT_BASE
   while awk -v p="$PORT" -F'\t' '$1==p{f=1} END{exit !f}' "$REGISTRY" || ss -ltn | grep -q ":${PORT} "; do
     PORT=$((PORT+1))
+    [ "$PORT" -le "$PORT_MAX" ] || die "No free port left in ${PORT_BASE}-${PORT_MAX}."
   done
+fi
+
+# Guard every path into $PORT, including --port and the registry.
+if [ "$PORT" -ge "$FPM_MIN" ] && [ "$PORT" -le "$FPM_MAX" ]; then
+  die "Port ${PORT} is inside ISPConfig's PHP-FPM pool range ${FPM_MIN}-${FPM_MAX}.
+  The next PHP site created here would be given the same port, php-fpm would fail to
+  bind it, and systemd would take every PHP site on this host down with it.
+  Pick a free port in ${PORT_BASE}-${PORT_MAX}."
+fi
+if [ "$PORT" -lt "$PORT_BASE" ] || [ "$PORT" -gt "$PORT_MAX" ]; then
+  die "Port ${PORT} is outside the Ghost range ${PORT_BASE}-${PORT_MAX}."
 fi
 echo "==> ${DOMAIN}: user=${SYSUSER}(${UID_N}) shell=${SHELLUSER} port=${PORT}"
 
