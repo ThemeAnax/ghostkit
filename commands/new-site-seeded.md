@@ -26,14 +26,21 @@ using them:
 | themeseed sites file | `~/.themeseed/sites.json` |
 | seed site key | `$1-ghost` |
 
+These are the house defaults. Use them without asking, and show them with the rest:
+
+| | |
+|---|---|
+| admin email / `mail.from` | `enquiry@themeanax.com` |
+| author name | `ThemeAnax` |
+| author email | `enquiry@themeanax.com` |
+
 Ask me, in ONE question, only for what you cannot derive and do not already have:
 
 - the ISPConfig server to install on, unless `$2` was given (never guess this —
   `sshmanager_provision_domain` needs `server_name`, and names do not match ids)
-- admin email, author name, author email
 - how many posts, and the topics to write about
-- the SendGrid API key, if transactional mail is wanted
-- a different base domain or package dir, if the derived ones do not exist
+- the SendGrid API key, if transactional mail is wanted and no key is in reach
+- a different base domain, package dir, admin email or author, if I want one
 
 Then confirm ghostkit is at least 0.8.0 (`version` tool). Older versions allow ports
 inside ISPConfig's FPM range. If it is older, say so and stop.
