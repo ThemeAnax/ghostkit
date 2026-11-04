@@ -1,6 +1,6 @@
 {
   "name": "@indianic/ghostkit",
-  "version": "0.8.0",
+  "version": "0.8.1",
   "publishConfig": {
     "registry": "https://npm.indianic.in/"
   },
@@ -15,6 +15,7 @@
     "dist",
     "scripts",
     "plugin",
+    "commands",
     ".mcp.json",
     ".claude-plugin",
     "README.md"

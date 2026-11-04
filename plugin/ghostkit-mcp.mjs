@@ -31657,6 +31657,36 @@ async function resolveSite(ssh, domain2) {
     unitPath: `${docroot}/.config/systemd/user/ghost.service`
   };
 }
+var GHOST_PORT_MIN = 51e3;
+var GHOST_PORT_MAX = 51999;
+var FPM_PORT_MIN = 9e3;
+var FPM_PORT_MAX = 9099;
+async function checkGhostPort(ssh, port) {
+  const problems = [];
+  if (!Number.isInteger(port) || port <= 0) {
+    problems.push(`'${port}' is not a port number.`);
+  }
+  if (port >= FPM_PORT_MIN && port <= FPM_PORT_MAX) {
+    problems.push(
+      `${port} is inside ISPConfig's PHP-FPM pool range ${FPM_PORT_MIN}\u2013${FPM_PORT_MAX}. The next PHP site created here will be given this port, php-fpm will fail to bind it, and systemd will take the whole php-fpm service \u2014 every PHP site on the host \u2014 down with it.`
+    );
+  }
+  if (port < GHOST_PORT_MIN || port > GHOST_PORT_MAX) {
+    problems.push(`${port} is outside the Ghost range ${GHOST_PORT_MIN}\u2013${GHOST_PORT_MAX}.`);
+  }
+  const r = await ssh.exec(`ss -tln 2>/dev/null | grep -c ":${port} " || true`);
+  const listening = Number(r.stdout.trim()) > 0;
+  if (listening) problems.push(`Something is already listening on ${port}.`);
+  return { port, ok: problems.length === 0, problems, listening };
+}
+async function suggestGhostPort(ssh) {
+  const r = await ssh.exec(
+    `{ awk -F'\\t' 'NR>1{print $1}' /etc/ghost/sites.tsv 2>/dev/null; ss -tln 2>/dev/null | grep -oE '127\\.0\\.0\\.1:[0-9]+' | cut -d: -f2; } | awk -v lo=${GHOST_PORT_MIN} -v hi=${GHOST_PORT_MAX} '$1>=lo && $1<=hi' | sort -n | tail -1`
+  );
+  const highest = Number(r.stdout.trim());
+  if (!Number.isFinite(highest) || highest < GHOST_PORT_MIN) return GHOST_PORT_MIN;
+  return highest + 1;
+}
 function apacheDirectives(port) {
   return [
     "ProxyRequests Off",
@@ -31692,6 +31722,23 @@ async function applyVhost(ssh, domain2, directives, opts = {}) {
   if (files.length === 0) {
     throw new Error(
       `No Apache vhost found for '${domain2}'. Create the website in ISPConfig first, then run this again.`
+    );
+  }
+  const ipBound = [];
+  for (const file2 of files) {
+    const bound = await ssh.exec(
+      `grep -hoE '<VirtualHost[[:space:]]+[0-9][0-9.]*:[0-9]+' ${shellQuote(file2)} | sort -u || true`
+    );
+    if (bound.stdout.trim()) ipBound.push(`${file2}: ${bound.stdout.trim().split("\n").join(", ")}`);
+  }
+  if (ipBound.length > 0 && !opts.rebind) {
+    throw new Error(
+      `This domain's vhost is bound to a literal IP, so nothing was written:
+  ${ipBound.join("\n  ")}
+
+Apache matches an IP-bound <VirtualHost> before any wildcard one on that address, which makes this site the default for EVERY hostname on the box \u2014 other sites get this certificate and a 403.
+
+Fix it in ISPConfig: set the site's IP to "*" (Sites > the domain > IPv4 Address), which regenerates the vhost as <VirtualHost *:80> / <VirtualHost *:443>. Editing the file is not a fix \u2014 ISPConfig rewrites it. Pass rebind:true only as a stopgap until the panel setting is corrected.`
     );
   }
   const marker = "# >>> ghostkit managed >>>";
@@ -32186,7 +32233,8 @@ server.registerTool(
       user: raw.database?.user || s.database.user,
       password: raw.database?.password || s.database.password
     };
-    if (s.appPort && !raw.site?.port) raw.site = { ...raw.site ?? {}, port: s.appPort };
+    const appPortUsable = !!s.appPort && s.appPort >= GHOST_PORT_MIN && s.appPort <= GHOST_PORT_MAX;
+    if (appPortUsable && !raw.site?.port) raw.site = { ...raw.site ?? {}, port: s.appPort };
     writeConfigFile(path, raw);
     const mask = (v) => v ? `${v.slice(0, 3)}***(${v.length})` : "";
     return json2({
@@ -32199,6 +32247,7 @@ server.registerTool(
         ssh_port: s.port,
         tenant_user: s.username,
         application_port: s.appPort,
+        application_port_note: s.appPort ? appPortUsable ? void 0 : `sshcon records application port ${s.appPort}, which is OUTSIDE the Ghost range ${GHOST_PORT_MIN}\u2013${GHOST_PORT_MAX}, so it was NOT written to site.port. If it sits in 9000\u20139099 it belongs to ISPConfig's PHP-FPM pools: taking it would make php-fpm fail to bind later and drop every PHP site on the host. install_ghost will pick a safe port.` : void 0,
         database: { name: s.database.name, user: s.database.user, password: mask(s.database.password) }
       },
       still_required: missingFields(raw)
@@ -32215,8 +32264,13 @@ server.registerTool(
   async ({ dir }) => {
     const { cfg, ssh } = sshFor(dir);
     const r = await preflight(ssh, { domain: cfg.site.domain });
+    const portCheck = cfg.site.port ? await checkGhostPort(ssh, cfg.site.port) : void 0;
+    const strays = await ipBoundVhosts(ssh);
     return json2({
       ...r,
+      port: portCheck ? { ...portCheck, range: `${GHOST_PORT_MIN}-${GHOST_PORT_MAX}` } : { configured: null, suggested: await suggestGhostPort(ssh), range: `${GHOST_PORT_MIN}-${GHOST_PORT_MAX}` },
+      ip_bound_vhosts: strays.length ? strays : void 0,
+      ip_bound_note: strays.length ? "These vhosts bind a literal IP. Apache matches an IP-bound vhost before any wildcard one on that address, so each of these answers for every other hostname on the box \u2014 wrong certificate, then a 403. Fix the site's IPv4 Address to '*' in ISPConfig; editing the file does not hold." : void 0,
       note: r.db.engine === "mariadb" ? "Ghost officially supports MySQL 8 only; MariaDB is unsupported but works in practice." : void 0
     });
   }
@@ -32244,7 +32298,19 @@ server.registerTool(
     await ssh.must(
       `echo ${shellQuote(b64)} | base64 -d > /usr/local/sbin/ghost-site-enable && chmod +x /usr/local/sbin/ghost-site-enable`
     );
-    const effectivePort = port ?? cfg.site.port ?? void 0;
+    const chosen = port ?? cfg.site.port ?? await suggestGhostPort(ssh);
+    const verdict = await checkGhostPort(ssh, chosen);
+    if (!verdict.ok) {
+      return json2({
+        ok: false,
+        error: "unsafe port",
+        port: chosen,
+        problems: verdict.problems,
+        suggested_port: await suggestGhostPort(ssh),
+        note: `Ghost runs on ${GHOST_PORT_MIN}\u2013${GHOST_PORT_MAX} here. Set site.port to a free port in that range and run this again \u2014 do not reuse whatever port ISPConfig allocated, it does not know about Ghost.`
+      });
+    }
+    const effectivePort = chosen;
     const args = [
       `--domain ${shellQuote(cfg.site.domain)}`,
       effectivePort ? `--port ${effectivePort}` : "",
@@ -32598,14 +32664,17 @@ server.registerTool(
   "publish_site",
   {
     title: "Make the site public: write the vhost directives and reload Apache",
-    description: "Write the Apache directive block into the domain's vhost, verify the config still parses, and reload. Takes a backup first and restores it if Apache rejects the result, so a bad write cannot take the host down. Also rewrites an IP-bound <VirtualHost> to a wildcard: an IP-literal vhost outranks every wildcard one on the same address, which would make this site answer for EVERY domain on the host. Run this LAST \u2014 it is the step that exposes the site. Pass dry_run to see the block without writing.",
+    description: "Write the Apache directive block into the domain's vhost, verify the config still parses, and reload. Takes a backup first and restores it if Apache rejects the result, so a bad write cannot take the host down. REFUSES to write when the domain's vhost is bound to a literal IP: Apache matches an IP-bound <VirtualHost> before any wildcard one on that address, so such a site answers for EVERY hostname on the box \u2014 the wrong certificate, then a 403. That is a panel setting (the site's IPv4 Address), not a file edit, because ISPConfig regenerates the file. Run this LAST \u2014 it is the step that exposes the site. Pass dry_run to see the block without writing.",
     inputSchema: {
       dir: external_exports.string().optional(),
       dry_run: external_exports.boolean().optional().describe("Return the directives without touching the server."),
+      rebind: external_exports.boolean().optional().describe(
+        "Stopgap: rewrite an IP-bound <VirtualHost> to a wildcard instead of refusing. ISPConfig regenerates the file from the panel's IP setting, so this lasts only until then \u2014 fix the site's IPv4 Address."
+      ),
       reload: external_exports.boolean().optional().describe("Reload Apache after writing. Default true; false writes and configtests only.")
     }
   },
-  async ({ dir, dry_run, reload }) => {
+  async ({ dir, dry_run, reload, rebind }) => {
     const { cfg, ssh } = sshFor(dir);
     const site = await resolveSite(ssh, cfg.site.domain);
     const claimed = await setupStatus(ssh, site.port, cfg.site.domain);
@@ -32622,7 +32691,7 @@ server.registerTool(
     if (dry_run) {
       return json2({ ok: true, dry_run: true, port: site.port, apache_directives: directives });
     }
-    const applied = await applyVhost(ssh, cfg.site.domain, directives, { reload });
+    const applied = await applyVhost(ssh, cfg.site.domain, directives, { reload, rebind });
     const strays = await ipBoundVhosts(ssh);
     return json2({
       ok: true,
@@ -32632,9 +32701,9 @@ server.registerTool(
       backups: applied.backups,
       reloaded: applied.reloaded,
       rebound_to_wildcard: applied.rebound || void 0,
-      rebound_note: applied.rebound ? "This vhost was bound to a literal IP and has been rewritten to <VirtualHost *:\u2026>. Left alone it would have outranked every other site on that address and served this site for all of them." : void 0,
+      rebound_note: applied.rebound ? "STOPGAP ONLY \u2014 this vhost was bound to a literal IP and has been rewritten to <VirtualHost *:\u2026>. ISPConfig regenerates this file from the site's IPv4 Address in the panel, so set that to '*' now; otherwise the binding comes back and this site answers for every hostname on the box." : void 0,
       other_ip_bound_vhosts: strays.length ? strays : void 0,
-      other_ip_bound_note: strays.length ? "These vhosts still bind a literal IP and may be hijacking name-based matching for other domains." : void 0,
+      other_ip_bound_note: strays.length ? "These vhosts still bind a literal IP, so each one captures name-based matching for every other domain on that address \u2014 wrong certificate, then 403. Set their IPv4 Address to '*' in ISPConfig." : void 0,
       url: `https://${cfg.site.domain}/`,
       verify: `curl -s -o /dev/null -w '%{http_code}' https://${cfg.site.domain}/   # expect 200, not 301`,
       note: "ISPConfig owns this file and may regenerate it. The block is fenced in ghostkit markers, so re-running this tool replaces it rather than appending a second copy. Do not apply these directives through sshmanager_update_domain \u2014 it returns success and renders them in its UI without them ever reaching ISPConfig or the disk."

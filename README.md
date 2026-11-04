@@ -148,6 +148,21 @@ whole `database` block by hand; nothing can discover them for you.
 Note the `server` block has one field. Nothing is pre-answered: a value in this file is a
 decision you made, never one ghostkit guessed for you.
 
+## Slash commands
+
+Installed as a Claude Code plugin, ghostkit ships two runbooks so a whole site is one
+line instead of a pasted brief. Each derives what it can from the theme name, asks once
+for the rest, then runs the steps — stopping at the places that have bitten before: the
+missing config fields, the preflight fixes, the loopback port, and the vhost check.
+
+| Command | Content comes from |
+|---|---|
+| `/ghostkit:new-site <theme> [server]` | the theme's own demo export (`.json` or `.zip`) |
+| `/ghostkit:new-site-seeded <theme> [server]` | [themeseed](https://github.com/ThemeAnax/themeseed)-generated articles |
+
+Both refuse a loopback port outside 51000–51999 and stop on an IP-bound vhost, because
+each of those has taken a whole host down once already.
+
 ## Tools
 
 | Tool | Does |
