@@ -33,6 +33,7 @@ These are the house defaults. Use them without asking, and show them with the re
 | admin email / `mail.from` | `enquiry@themeanax.com` |
 | author name | `ThemeAnax` |
 | author email | `enquiry@themeanax.com` |
+| summary mail goes to | `vipin.sarathe@indianic.com` |
 
 Ask me, in ONE question, only for what you cannot derive and do not already have:
 
@@ -149,7 +150,8 @@ Do not import a demo-content export here — the content comes from themeseed.
 Open the live site. Every route the theme's `routes.yaml` defines should load, and
 the seeded posts should show their feature images. Tell me any that 404.
 
-Finally, draft a session summary with the mailman MCP: site URL, Ghost admin URL,
+Finally, draft a session summary with the mailman MCP to `vipin.sarathe@indianic.com`
+(say so, and use a different address if I name one): site URL, Ghost admin URL,
 admin email and generated password, Admin API key, sshcon alias and host, database
 name/user/password, and the chosen port. Show me the draft and send it only after I
 confirm.

@@ -7,7 +7,7 @@
   },
   "metadata": {
     "description": "Ghost provisioning for Claude Code",
-    "version": "0.5.0"
+    "version": "0.8.3"
   },
   "plugins": [
     {
