@@ -1,5 +1,8 @@
 #!/usr/bin/env node
 import { createInterface } from "node:readline/promises";
+import { existsSync, readFileSync } from "node:fs";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { Command } from "commander";
 import pc from "picocolors";
 import { initConfig, loadConfig } from "../core/config.js";
@@ -8,7 +11,24 @@ import { preflight, setupStatus, installedVersion } from "../core/ghost.js";
 import { resolveSite, apacheDirectives, serviceState } from "../core/site.js";
 import { EDITORS, detectAll, registerEditor, latestVersion, launchCommand, PACKAGE } from "../core/editors.js";
 
-const VERSION = "0.5.0";
+// Read from the installed package.json, never a literal: a hand-maintained
+// string drifts the moment someone forgets it, and `--version` is the one
+// answer nobody double-checks. This printed 0.5.0 from a 0.8.3 install.
+const VERSION: string = (() => {
+  const here = dirname(fileURLToPath(import.meta.url));
+  for (const rel of ["../../package.json", "../package.json"]) {
+    try {
+      const p = resolve(here, rel);
+      if (existsSync(p)) {
+        const v = JSON.parse(readFileSync(p, "utf8")).version;
+        if (typeof v === "string" && v) return v;
+      }
+    } catch {
+      // try the next candidate
+    }
+  }
+  return "0.0.0";
+})();
 
 const program = new Command();
 program.name("ghostkit").description("Install Ghost on any SSH-reachable ISPConfig host").version(VERSION);
